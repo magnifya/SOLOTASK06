@@ -1,7 +1,7 @@
 """Standard-library HTTP front end for :class:`ContentAddressedStore`.
 
-Only JSON error bodies are custom: every failure is a single line
-``{"error": "..."}`` with a status code of 400, 404, 405 or 411.
+Every failure is a single-line JSON body ``{"error": "..."}`` with status 400,
+404, 405 or 411.
 """
 
 from __future__ import annotations
@@ -20,15 +20,9 @@ _SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 _OBJECTS_PATH = "/v1/objects"
 _BLOBS_PATH = "/v1/blobs"
 _DEFAULT_CONTENT_TYPE = "application/octet-stream"
-
 _BAD_REQUEST_PREFIXES = (
-    "invalid sha256",
-    "invalid limit",
-    "invalid key",
-    "invalid prefix",
-    "invalid after",
-    "payload",
-    "content_type",
+    "invalid sha256", "invalid limit", "invalid key", "invalid prefix",
+    "invalid after", "payload", "content_type",
 )
 
 
@@ -50,31 +44,26 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
     sys_version = ""
     protocol_version = "HTTP/1.1"
 
-    # ------------------------------------------------------------------
-    # plumbing
-    # ------------------------------------------------------------------
     def log_message(self, fmt, *args):
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
 
-    def _send(self, status, body, content_type="application/json",
-              extra_headers=None, head_only=False, length=None):
+    def _send(self, status, body, content_type="application/json", extra_headers=(),
+              head_only=False, length=None):
         self.send_response(status)
         if status != 204:
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body) if length is None else length))
-        for name, value in (extra_headers or ()):
+        for name, value in extra_headers:
             self.send_header(name, value)
         self.end_headers()
         if body and not head_only and status != 204:
             self.wfile.write(body)
 
-    def _send_json_error(self, status, message):
+    def _error(self, status, message):
         self._send(status, _json_bytes({"error": message}))
 
     def _read_body(self):
         raw = self.headers.get("Content-Length")
-        if raw is None:
-            return None
         try:
             length = int(raw)
         except (TypeError, ValueError):
@@ -83,9 +72,6 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
             return None
         return self.rfile.read(length) if length else b""
 
-    # ------------------------------------------------------------------
-    # verbs
-    # ------------------------------------------------------------------
     def do_GET(self):
         self._dispatch("GET")
 
@@ -103,88 +89,73 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
         try:
             if path == "/healthz":
                 if method != "GET":
-                    return self._send_json_error(405, "method not allowed")
+                    return self._error(405, "method not allowed")
                 return self._send(200, _json_bytes({"ok": True}))
             if path == _OBJECTS_PATH:
                 if method != "GET":
-                    return self._send_json_error(405, "method not allowed")
+                    return self._error(405, "method not allowed")
                 return self._list(urlparse(self.path).query)
             if path.startswith(_OBJECTS_PATH + "/"):
                 return self._object(method, unquote(path[len(_OBJECTS_PATH) + 1:]))
             if path.startswith(_BLOBS_PATH + "/"):
                 if method != "GET":
-                    return self._send_json_error(405, "method not allowed")
+                    return self._error(405, "method not allowed")
                 return self._blob(unquote(path[len(_BLOBS_PATH) + 1:]))
-            return self._send_json_error(404, "not found")
+            return self._error(404, "not found")
         except ObjectStoreError as exc:
-            return self._send_json_error(_status_for(str(exc)), str(exc))
+            return self._error(_status_for(str(exc)), str(exc))
         except (BrokenPipeError, ConnectionResetError):
             return None
 
-    # ------------------------------------------------------------------
-    # routes
-    # ------------------------------------------------------------------
     def _object(self, method, key):
         if not key:
-            return self._send_json_error(400, "invalid key")
+            return self._error(400, "invalid key")
         store = self.server.store
         if method == "PUT":
             body = self._read_body()
             if body is None:
-                return self._send_json_error(411, "length required")
+                return self._error(411, "length required")
             try:
                 existing = store.head(key)
             except ObjectStoreError:
                 existing = None
             entry = store.put(key, body, content_type=self.headers.get("Content-Type"))
-            payload = {"key": key, "sha256": entry["sha256"], "size": entry["size"]}
             repeated = existing is not None and existing["sha256"] == entry["sha256"]
-            return self._send(200 if repeated else 201, _json_bytes(payload))
+            body_out = {"key": key, "sha256": entry["sha256"], "size": entry["size"]}
+            return self._send(200 if repeated else 201, _json_bytes(body_out))
         if method == "GET":
             data, entry = store.get(key)
-            return self._send(
-                200,
-                data,
-                content_type=entry["content_type"] or _DEFAULT_CONTENT_TYPE,
-                extra_headers=[("X-Content-Sha256", entry["sha256"])],
-            )
+            return self._send(200, data, entry["content_type"] or _DEFAULT_CONTENT_TYPE,
+                              [("X-Content-Sha256", entry["sha256"])])
         if method == "HEAD":
             entry = store.head(key)
-            return self._send(
-                200,
-                b"",
-                content_type=entry["content_type"] or _DEFAULT_CONTENT_TYPE,
-                extra_headers=[("X-Content-Sha256", entry["sha256"])],
-                head_only=True,
-                length=entry["size"],
-            )
+            return self._send(200, b"", entry["content_type"] or _DEFAULT_CONTENT_TYPE,
+                              [("X-Content-Sha256", entry["sha256"])], head_only=True,
+                              length=entry["size"])
         if method == "DELETE":
             store.delete(key)
             return self._send(204, b"")
-        return self._send_json_error(405, "method not allowed")
+        return self._error(405, "method not allowed")
 
     def _list(self, query):
         params = parse_qs(query, keep_blank_values=True)
-        prefix = params.get("prefix", [""])[0]
-        after = params.get("after", [None])[0] or None
         raw_limit = params.get("limit", [str(DEFAULT_LIMIT)])[0]
         try:
             limit = int(raw_limit)
         except (TypeError, ValueError):
             raise ObjectStoreError("invalid limit: %r" % (raw_limit,))
-        result = self.server.store.list_objects(prefix=prefix, after=after, limit=limit)
+        result = self.server.store.list_objects(
+            prefix=params.get("prefix", [""])[0],
+            after=params.get("after", [None])[0] or None,
+            limit=limit,
+        )
         return self._send(200, _json_bytes(result))
 
     def _blob(self, sha256):
         if _SHA256_RE.match(sha256) is None:
             raise ObjectStoreError("invalid sha256: %r" % (sha256,))
-        data = self.server.store.blob(sha256)
-        return self._send(
-            200,
-            data,
-            content_type=_DEFAULT_CONTENT_TYPE,
-            extra_headers=[("X-Content-Sha256", sha256)],
-        )
+        return self._send(200, self.server.store.blob(sha256), _DEFAULT_CONTENT_TYPE,
+                          [("X-Content-Sha256", sha256)])
 
 
 class ObjectStoreHTTPServer(ThreadingHTTPServer):

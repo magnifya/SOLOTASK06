@@ -1,8 +1,8 @@
 """Command line interface.
 
-Usage: ``python3 -m objstore --data-dir DIR <serve|put|get|list|delete>``.
-Every command prints exactly one line of JSON on stdout and exits 0 on
-success; failures print one line of JSON on stderr and exit non-zero.
+``python3 -m objstore --data-dir DIR <serve|put|get|list|delete>``. Each command
+prints one line of JSON on stdout and exits 0 on success, or one line of JSON on
+stderr and exits non-zero on failure.
 """
 
 from __future__ import annotations
@@ -19,19 +19,22 @@ from .store import DEFAULT_LIMIT, ContentAddressedStore, ObjectStoreError
 __all__ = ["build_parser", "main"]
 
 DEFAULT_DATA_DIR = "./objstore_data"
-EXIT_USAGE = 2
+EXIT_FAILURE = 2
+
+
+class _Parser(argparse.ArgumentParser):
+    """ArgumentParser that reports usage errors as one line of JSON."""
+
+    def error(self, message):
+        _fail(message)
+        raise SystemExit(EXIT_FAILURE)
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(
-        prog="objstore",
-        description="Content-addressed multi-tenant object storage backend.",
-    )
-    parser.add_argument(
-        "--data-dir",
-        default=DEFAULT_DATA_DIR,
-        help="directory holding index.json and blobs (default: %(default)s)",
-    )
+    parser = _Parser(prog="objstore",
+                     description="Content-addressed object storage backend.")
+    parser.add_argument("--data-dir", default=DEFAULT_DATA_DIR,
+                        help="directory holding index.json and blobs (default: %(default)s)")
     sub = parser.add_subparsers(dest="command", required=True)
 
     serve = sub.add_parser("serve", help="run the HTTP API until SIGINT/SIGTERM")
@@ -63,11 +66,10 @@ def _emit(payload):
 
 
 def _fail(message):
-    sys.stderr.write(
-        json.dumps({"ok": False, "error": message}, sort_keys=True, separators=(",", ":")) + "\n"
-    )
+    sys.stderr.write(json.dumps({"ok": False, "error": message},
+                                sort_keys=True, separators=(",", ":")) + "\n")
     sys.stderr.flush()
-    return EXIT_USAGE
+    return EXIT_FAILURE
 
 
 def _interrupt(signum, frame):
@@ -80,11 +82,9 @@ def _cmd_serve(args, store):
     _emit({"ok": True, "addr": "%s:%d" % (host, port), "data_dir": store.root})
     for name in ("SIGINT", "SIGTERM"):
         signum = getattr(signal, name, None)
-        if signum is None:
-            continue
         try:
             signal.signal(signum, _interrupt)
-        except (ValueError, OSError):
+        except (TypeError, ValueError, OSError):
             pass
     try:
         httpd.serve_forever(poll_interval=0.25)
@@ -110,15 +110,8 @@ def _cmd_get(args, store):
         os.makedirs(directory, exist_ok=True)
     with open(args.out, "wb") as handle:
         handle.write(data)
-    _emit(
-        {
-            "ok": True,
-            "key": args.key,
-            "sha256": entry["sha256"],
-            "size": entry["size"],
-            "out": os.path.abspath(args.out),
-        }
-    )
+    _emit({"ok": True, "key": args.key, "sha256": entry["sha256"], "size": entry["size"],
+           "out": os.path.abspath(args.out)})
     return 0
 
 
@@ -134,22 +127,14 @@ def _cmd_delete(args, store):
     return 0
 
 
-_HANDLERS = {
-    "serve": _cmd_serve,
-    "put": _cmd_put,
-    "get": _cmd_get,
-    "list": _cmd_list,
-    "delete": _cmd_delete,
-}
+_HANDLERS = {"serve": _cmd_serve, "put": _cmd_put, "get": _cmd_get,
+             "list": _cmd_list, "delete": _cmd_delete}
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
     try:
         store = ContentAddressedStore(args.data_dir)
-    except ObjectStoreError as exc:
-        return _fail(str(exc))
-    try:
         return _HANDLERS[args.command](args, store)
     except ObjectStoreError as exc:
         return _fail(str(exc))

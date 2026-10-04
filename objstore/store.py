@@ -1,13 +1,9 @@
-"""Content-addressed object store.
+"""Content-addressed object store (standard library only).
 
-Blob bytes live once under ``<root>/blobs/<sha256>`` so identical payloads are
-stored exactly once regardless of how many keys point at them. Object metadata
+Blob bytes are stored once as ``<root>/blobs/<sha256>``; object metadata
 (``key -> {sha256, size, content_type}``) lives in ``<root>/index.json`` and is
-always rewritten through a temporary file plus ``os.replace`` so a crash can
-never observe a half-written index.
-
-The store is safe to use from several threads: every read that must be
-consistent and every mutation runs under a single re-entrant lock.
+always rewritten through a temporary file plus ``os.replace``. Every mutation
+and every consistent read runs under a single re-entrant lock.
 """
 
 from __future__ import annotations
@@ -30,11 +26,10 @@ _SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 
 
 class ObjectStoreError(Exception):
-    """Raised for missing objects, invalid digests and corrupted indexes."""
+    """Missing object, invalid key/digest/limit, or a corrupted index."""
 
 
 def _is_sha256(value):
-    """Return True when *value* is a lowercase hex sha256 digest."""
     return isinstance(value, str) and _SHA256_RE.match(value) is not None
 
 
@@ -68,36 +63,29 @@ class ContentAddressedStore:
         os.makedirs(self.blobs_dir, exist_ok=True)
         self._index = self._load_index()
 
-    # ------------------------------------------------------------------
-    # index handling
-    # ------------------------------------------------------------------
+    # -- index ---------------------------------------------------------
     def _load_index(self):
         if not os.path.exists(self.index_path):
             return {"version": INDEX_VERSION, "objects": {}}
         try:
             with open(self.index_path, "rb") as handle:
-                raw = handle.read()
-            document = json.loads(raw.decode("utf-8"))
+                document = json.loads(handle.read().decode("utf-8"))
         except (OSError, ValueError, UnicodeDecodeError) as exc:
             raise ObjectStoreError("corrupted index: %s" % (exc,))
-        if not isinstance(document, dict):
-            raise ObjectStoreError("corrupted index: root is not an object")
-        objects = document.get("objects")
-        if not isinstance(objects, dict):
+        if not isinstance(document, dict) or not isinstance(document.get("objects"), dict):
             raise ObjectStoreError("corrupted index: missing objects map")
-        clean = {}
-        for key, entry in objects.items():
+        objects = {}
+        for key, entry in document["objects"].items():
             if not isinstance(key, str):
                 raise ObjectStoreError("corrupted index: non-string key")
-            clean[key] = self._validate_entry(key, entry)
-        return {"version": INDEX_VERSION, "objects": clean}
+            objects[key] = self._validate_entry(key, entry)
+        return {"version": INDEX_VERSION, "objects": objects}
 
     @staticmethod
     def _validate_entry(key, entry):
         if not isinstance(entry, dict):
             raise ObjectStoreError("corrupted index: entry for %r is not an object" % (key,))
-        sha = entry.get("sha256")
-        size = entry.get("size")
+        sha, size = entry.get("sha256"), entry.get("size")
         content_type = entry.get("content_type")
         if not _is_sha256(sha):
             raise ObjectStoreError("corrupted index: bad sha256 for %r" % (key,))
@@ -108,13 +96,14 @@ class ContentAddressedStore:
         return {"sha256": sha, "size": size, "content_type": content_type}
 
     def _save_index(self):
-        document = {"version": INDEX_VERSION, "objects": self._index["objects"]}
-        payload = json.dumps(document, sort_keys=True, separators=(",", ":"))
+        payload = json.dumps(
+            {"version": INDEX_VERSION, "objects": self._index["objects"]},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         _atomic_write(self.index_path, payload.encode("utf-8") + b"\n")
 
-    # ------------------------------------------------------------------
-    # validation helpers
-    # ------------------------------------------------------------------
+    # -- validation ----------------------------------------------------
     @staticmethod
     def _check_key(key):
         if not isinstance(key, str) or not key or "\x00" in key:
@@ -127,7 +116,7 @@ class ContentAddressedStore:
     def _check_limit(limit):
         if isinstance(limit, bool) or not isinstance(limit, int):
             raise ObjectStoreError("invalid limit: %r" % (limit,))
-        if limit < 1 or limit > MAX_LIMIT:
+        if not 1 <= limit <= MAX_LIMIT:
             raise ObjectStoreError("invalid limit: %r" % (limit,))
         return limit
 
@@ -137,12 +126,7 @@ class ContentAddressedStore:
             raise ObjectStoreError("invalid sha256: %r" % (sha256,))
         return sha256
 
-    def _blob_path(self, sha256):
-        return os.path.join(self.blobs_dir, sha256)
-
-    # ------------------------------------------------------------------
-    # object API
-    # ------------------------------------------------------------------
+    # -- object API ----------------------------------------------------
     def put(self, key, payload, content_type=None):
         """Store *payload* under *key* and return its metadata entry."""
         self._check_key(key)
@@ -154,7 +138,7 @@ class ContentAddressedStore:
         sha = hashlib.sha256(data).hexdigest()
         entry = {"sha256": sha, "size": len(data), "content_type": content_type}
         with self._lock:
-            path = self._blob_path(sha)
+            path = os.path.join(self.blobs_dir, sha)
             if not os.path.exists(path):
                 _atomic_write(path, data)
             self._index["objects"][key] = entry
@@ -177,7 +161,7 @@ class ContentAddressedStore:
             return dict(entry)
 
     def delete(self, key):
-        """Drop *key*. Blobs stay on disk because other keys may share them."""
+        """Drop *key*; shared blobs stay on disk for the keys still using them."""
         self._check_key(key)
         with self._lock:
             if key not in self._index["objects"]:
@@ -186,30 +170,24 @@ class ContentAddressedStore:
             self._save_index()
 
     def blob(self, sha256):
-        """Return the raw bytes of a stored digest."""
+        """Return the raw bytes stored under digest *sha256*."""
         self._require_sha(sha256)
         with self._lock:
             try:
-                with open(self._blob_path(sha256), "rb") as handle:
+                with open(os.path.join(self.blobs_dir, sha256), "rb") as handle:
                     return handle.read()
             except FileNotFoundError:
                 raise ObjectStoreError("not found: blob %s" % (sha256,))
             except OSError as exc:
                 raise ObjectStoreError("blob read failed: %s" % (exc,))
 
-    def has_blob(self, sha256):
-        """Return True when the digest is present in the blob directory."""
-        self._require_sha(sha256)
-        with self._lock:
-            return os.path.exists(self._blob_path(sha256))
-
     def blob_digests(self):
-        """Return the sorted list of digests currently stored on disk."""
+        """Return the sorted digests currently present in the blob directory."""
         with self._lock:
             return sorted(name for name in os.listdir(self.blobs_dir) if _is_sha256(name))
 
     def list_objects(self, prefix="", after=None, limit=DEFAULT_LIMIT):
-        """Return one page of ``{"items": [...], "next_after": <str|null>}``."""
+        """Return ``{"items": [...], "next_after": <str|null>}`` for one page."""
         if not isinstance(prefix, str):
             raise ObjectStoreError("invalid prefix: %r" % (prefix,))
         if after is not None and not isinstance(after, str):
@@ -221,16 +199,13 @@ class ContentAddressedStore:
             if after:
                 keys = [key for key in keys if key > after]
             page = keys[:limit]
-            items = []
-            for key in page:
-                entry = objects[key]
-                items.append(
-                    {
-                        "key": key,
-                        "sha256": entry["sha256"],
-                        "size": entry["size"],
-                        "content_type": entry["content_type"],
-                    }
-                )
-            next_after = page[-1] if len(keys) > len(page) else None
-            return {"items": items, "next_after": next_after}
+            items = [
+                {
+                    "key": key,
+                    "sha256": objects[key]["sha256"],
+                    "size": objects[key]["size"],
+                    "content_type": objects[key]["content_type"],
+                }
+                for key in page
+            ]
+            return {"items": items, "next_after": page[-1] if len(keys) > len(page) else None}
