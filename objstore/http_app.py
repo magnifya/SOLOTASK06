@@ -1,7 +1,7 @@
 """Standard-library HTTP front end for :class:`ContentAddressedStore`.
 
 Every failure is a single-line JSON body ``{"error": "..."}`` with status 400,
-404, 405, 409, 411 or 500 (500 for a corrupted blob or a blob/upload I/O
+404, 405, 409, 411, 412 or 500 (500 for a corrupted blob or a blob/upload I/O
 error).
 """
 
@@ -18,11 +18,13 @@ from .store import (
     ContentAddressedStore,
     ObjectStoreError,
     SessionConflict,
+    _MISSING,
 )
 
 __all__ = ["ObjectStoreHandler", "ObjectStoreHTTPServer", "create_server"]
 
 _SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+_ETAG_RE = re.compile(r'\A"([0-9a-f]{64})"\Z')
 _OBJECTS_PATH = "/v1/objects"
 _BLOBS_PATH = "/v1/blobs"
 _UPLOADS_PATH = "/v1/uploads"
@@ -31,7 +33,7 @@ _DECIMAL_RE = re.compile(r"\A[0-9]+\Z")
 _BAD_REQUEST_PREFIXES = (
     "invalid sha256", "invalid limit", "invalid key", "invalid prefix",
     "invalid after", "invalid size", "invalid offset", "invalid json",
-    "payload", "content_type",
+    "invalid precondition", "payload", "content_type",
 )
 _INTERNAL_ERRORS = ("corrupted blob", "blob io error", "upload io error")
 
@@ -43,6 +45,8 @@ def _json_bytes(payload):
 def _status_for(message):
     if message in _INTERNAL_ERRORS:
         return 500
+    if message == "precondition failed":
+        return 412
     for prefix in _BAD_REQUEST_PREFIXES:
         if message.startswith(prefix):
             return 400
@@ -86,6 +90,35 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
         if length < 0:
             return None
         return self.rfile.read(length) if length else b""
+
+    def _precondition_headers(self):
+        """Map If-Match / If-None-Match onto an ``expected_sha256`` argument.
+
+        Returns the omitted sentinel when no condition is present, ``None``
+        for ``If-None-Match: *`` (key must be absent), or the 64 hex digits
+        of a single double-quoted ``If-Match`` digest. Both headers at once,
+        a repeated header, or any other syntax is an ``invalid precondition``
+        error.
+        """
+        if_match = self.headers.get_all("If-Match") or []
+        if_none = self.headers.get_all("If-None-Match") or []
+        if len(if_match) > 1 or len(if_none) > 1 or (if_match and if_none):
+            raise ObjectStoreError("invalid precondition")
+        if if_match:
+            match = _ETAG_RE.match(if_match[0])
+            if match is None:
+                raise ObjectStoreError("invalid precondition")
+            return match.group(1)
+        if if_none:
+            if if_none[0] != "*":
+                raise ObjectStoreError("invalid precondition")
+            return None
+        return _MISSING
+
+    @staticmethod
+    def _etag_headers(entry):
+        return [("X-Content-Sha256", entry["sha256"]),
+                ("ETag", '"%s"' % entry["sha256"])]
 
     def do_GET(self):
         self._dispatch("GET")
@@ -146,25 +179,30 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
             body = self._read_body()
             if body is None:
                 return self._error(411, "length required")
+            ContentAddressedStore._check_key(key)
+            expected = self._precondition_headers()
             try:
                 existing = store.head(key)
             except ObjectStoreError:
                 existing = None
-            entry = store.put(key, body, content_type=self.headers.get("Content-Type"))
+            entry = store.put(key, body, content_type=self.headers.get("Content-Type"),
+                              expected_sha256=expected)
             repeated = existing is not None and existing["sha256"] == entry["sha256"]
             body_out = {"key": key, "sha256": entry["sha256"], "size": entry["size"]}
             return self._send(200 if repeated else 201, _json_bytes(body_out))
         if method == "GET":
             data, entry = store.get(key)
             return self._send(200, data, entry["content_type"] or _DEFAULT_CONTENT_TYPE,
-                              [("X-Content-Sha256", entry["sha256"])])
+                              self._etag_headers(entry))
         if method == "HEAD":
             entry = store.head(key)
             return self._send(200, b"", entry["content_type"] or _DEFAULT_CONTENT_TYPE,
-                              [("X-Content-Sha256", entry["sha256"])], head_only=True,
+                              self._etag_headers(entry), head_only=True,
                               length=entry["size"])
         if method == "DELETE":
-            store.delete(key)
+            ContentAddressedStore._check_key(key)
+            expected = self._precondition_headers()
+            store.delete(key, expected_sha256=expected)
             return self._send(204, b"")
         return self._error(405, "method not allowed")
 
@@ -228,9 +266,19 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
         if missing:
             raise ObjectStoreError("invalid json: missing field %r" % (missing[0],))
         content_type = document.get("content_type")
+        # Validate every body value before touching the conditional headers:
+        # request/body errors keep precedence over precondition errors.
+        key, size, digest = document["key"], document["size"], document["sha256"]
+        ContentAddressedStore._check_key(key)
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise ObjectStoreError("invalid size: %r" % (size,))
+        ContentAddressedStore._require_sha(digest)
+        if content_type is not None and not isinstance(content_type, str):
+            raise ObjectStoreError("content_type must be a string or None")
+        expected = self._precondition_headers()
         session_id = self.server.store.begin_upload(
-            document["key"], document["size"], document["sha256"],
-            content_type=content_type)
+            key, size, digest, content_type=content_type,
+            expected_sha256=expected)
         return self._send(201, _json_bytes({"session": session_id}))
 
     def _upload_session(self, method, tail, query):
