@@ -9,8 +9,8 @@ file plus `os.replace`) so a crash never leaves a half-written index behind. The
 same core is exposed three ways: as a Python API (`ContentAddressedStore`), as a
 standard-library HTTP service, and as a command line tool. It uses only the
 Python standard library, needs no network access and behaves deterministically,
-which makes it a suitable frozen baseline for later work on chunked and
-resumable uploads, object versioning and retention, lifecycle and garbage
+which makes it a suitable frozen baseline for later work on
+object versioning and retention, lifecycle and garbage
 collection, metadata indexing and listing, quotas and rate limiting, consistent
 hashing and rebalancing, erasure coding and repair, signed URLs and access
 control, cross-region replication and end-to-end audit.
@@ -69,6 +69,49 @@ page = store.list_objects(prefix="docs/", after=None, limit=100)
 result = store.collect_garbage()              # preview only
 store.collect_garbage(dry_run=False)          # actually delete
 ```
+
+Large or unreliable transfers can use persistent, resumable chunked uploads
+instead of a single `put`:
+
+```python
+import hashlib
+
+data = open("big.bin", "rb").read()
+upload_id = store.begin_upload("docs/big.bin", len(data),
+                               hashlib.sha256(data).hexdigest(),
+                               content_type="application/octet-stream")
+store.append_upload(upload_id, 0, data[:1 << 20])       # returns 1048576
+store.upload_status(upload_id)                          # {"key", "size", "sha256",
+                                                        #  "content_type", "offset",
+                                                        #  "completed"}
+store.append_upload(upload_id, 1 << 20, data[1 << 20:])
+entry = store.complete_upload(upload_id)                # same metadata as put
+# or store.abort_upload(upload_id) to drop the session
+```
+
+`begin_upload` validates its declaration exactly like `put` (same key and
+content-type rules, `size` a non-negative `int` with booleans rejected,
+`sha256` a 64-digit lowercase hex digest) and returns a unique session id
+string that is never reused. Creating a session changes no objects, and both
+the session and its confirmed progress survive reopening the data directory.
+`append_upload` only grows the session at its current end and never past the
+declared size; re-sending a byte range that lies entirely within the received
+prefix succeeds without growing when the bytes are identical, while different
+bytes in that range, an overlap crossing the end, a gap past it, or an empty
+chunk anywhere but exactly at the end all raise `ObjectStoreError` and change
+nothing. `complete_upload` publishes the object only when the received length
+and the SHA-256 of the full content match the declaration (zero-byte objects
+included) and returns the same metadata as `put`; until then the key keeps its
+old value and the partial content appears neither as an object nor as a blob.
+After completion appends fail, and repeated completions return the first
+result without touching the index, so later `put`/`delete` calls on the key
+are never clobbered. `abort_upload` drops the session and returns `None`
+without deleting any published object. An interrupted append leaves either
+the old confirmed offset or the whole new chunk, and an interrupted complete
+leaves either the old object or the fully published new one. Garbage
+collection never touches session data under `uploads/`; once a session
+completes or is aborted, its content is collected purely by object references
+— the completion record itself keeps nothing alive.
 
 `collect_garbage(dry_run=True)` returns
 `{"digests": [...], "bytes": <int>, "dry_run": <bool>}`: the digests sorted
@@ -141,14 +184,16 @@ Notes:
 
 ```
 <data-dir>/
-  index.json          # {"version":1,"objects":{"<key>":{"sha256","size","content_type"}}}
-  blobs/<sha256>      # raw object bytes, one file per distinct digest
+  index.json            # {"version":1,"objects":{"<key>":{"sha256","size","content_type"}}}
+  blobs/<sha256>        # raw object bytes, one file per distinct digest
+  uploads/<id>.json     # resumable-upload declaration, offset and completion record
+  uploads/<id>.data     # bytes received so far for that session
 ```
 
 ## Limits of this seed
 
-The following long-term goals are intentionally not implemented yet: chunked and
-resumable uploads, object versioning and retention policies, lifecycle policies
+The following long-term goals are intentionally not implemented yet: object
+versioning and retention policies, lifecycle policies
 on top of the existing garbage collection of unreferenced blobs, quotas and
 rate limiting, consistent hashing and rebalancing, erasure coding and repair,
 signed URLs and access control, cross-region replication and end-to-end audit

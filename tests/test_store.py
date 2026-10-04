@@ -295,7 +295,7 @@ class TestPersistence(StoreTestCase):
     def test_no_temporary_files_left_behind(self):
         for index in range(5):
             self.store.put("k%d" % index, b"payload-%d" % index)
-        self.assertEqual(sorted(os.listdir(self.root)), ["blobs", "index.json"])
+        self.assertEqual(sorted(os.listdir(self.root)), ["blobs", "index.json", "uploads"])
         self.assertEqual(len(self.store.blob_digests()), 5)
         self.assertTrue(all(len(name) == 64 for name in os.listdir(self.store.blobs_dir)))
 
@@ -620,6 +620,406 @@ class TestGarbageCollection(StoreTestCase):
             self.store.blob_digests(),
             sorted({item["sha256"] for item in page["items"]}),
         )
+
+
+class TestBeginUpload(StoreTestCase):
+    def test_begin_returns_unique_string_ids_and_changes_no_objects(self):
+        self.store.put("existing", b"old")
+        first = self.store.begin_upload("k", 5, sha(b"hello"), content_type="text/plain")
+        second = self.store.begin_upload("k", 5, sha(b"hello"))
+        self.assertIsInstance(first, str)
+        self.assertIsInstance(second, str)
+        self.assertNotEqual(first, second)
+        # no object is created or modified, no blob is written
+        self.assertEqual(self.store.get("existing"), (b"old", self.store.head("existing")))
+        with self.assertRaises(ObjectStoreError):
+            self.store.head("k")
+        self.assertEqual(self.store.blob_digests(), [sha(b"old")])
+        self.assertEqual([item["key"] for item in self.store.list_objects()["items"]],
+                         ["existing"])
+
+    def test_begin_validates_key_size_sha256_and_content_type(self):
+        for bad_key in ["", "/leading", "trailing/", "a//b", "a/./b", "a/../b",
+                        "a\x00b", None, 5]:
+            with self.assertRaises(ObjectStoreError):
+                self.store.begin_upload(bad_key, 1, sha(b"x"))
+        for bad_size in [-1, True, False, "5", 1.5, None]:
+            with self.assertRaises(ObjectStoreError):
+                self.store.begin_upload("k", bad_size, sha(b"x"))
+        for bad_sha in ["", "xyz", "A" * 64, "0" * 63, "0" * 65, None, 12]:
+            with self.assertRaises(ObjectStoreError):
+                self.store.begin_upload("k", 1, bad_sha)
+        with self.assertRaises(ObjectStoreError):
+            self.store.begin_upload("k", 1, sha(b"x"), content_type=7)
+        # nothing was recorded for the rejected attempts
+        self.assertEqual(os.listdir(self.store.uploads_dir), [])
+
+
+class TestUploadStatus(StoreTestCase):
+    def test_status_reports_declaration_offset_and_completed(self):
+        uid = self.store.begin_upload("docs/a.txt", 11, sha(b"hello world"),
+                                      content_type="text/plain")
+        self.assertEqual(self.store.upload_status(uid), {
+            "key": "docs/a.txt", "size": 11, "sha256": sha(b"hello world"),
+            "content_type": "text/plain", "offset": 0, "completed": False,
+        })
+
+    def test_unknown_or_malformed_session_ids_are_rejected(self):
+        for bad in ["", "nope", "f" * 64, "g" * 32, "A" * 32, None, 5, "../x"]:
+            with self.assertRaises(ObjectStoreError):
+                self.store.upload_status(bad)
+        # well-formed but never created
+        with self.assertRaises(ObjectStoreError):
+            self.store.upload_status("a" * 32)
+
+
+class TestAppendUpload(StoreTestCase):
+    def begin(self, payload, key="k", content_type=None):
+        return self.store.begin_upload(key, len(payload), sha(payload),
+                                       content_type=content_type)
+
+    def test_sequential_appends_grow_the_offset(self):
+        payload = b"hello world"
+        uid = self.begin(payload)
+        self.assertEqual(self.store.append_upload(uid, 0, b"hello "), 6)
+        self.assertEqual(self.store.upload_status(uid)["offset"], 6)
+        self.assertEqual(self.store.append_upload(uid, 6, b"world"), 11)
+        self.assertEqual(self.store.upload_status(uid)["offset"], 11)
+        self.assertFalse(self.store.upload_status(uid)["completed"])
+
+    def test_payload_kinds(self):
+        payload = b"abcabc"
+        uid = self.begin(payload)
+        self.assertEqual(self.store.append_upload(uid, 0, bytearray(b"abc")), 3)
+        self.assertEqual(self.store.append_upload(uid, 3, memoryview(b"abc")), 6)
+
+    def test_identical_retransmit_succeeds_without_growth(self):
+        payload = b"abcdef"
+        uid = self.begin(payload)
+        self.assertEqual(self.store.append_upload(uid, 0, payload), 6)
+        self.assertEqual(self.store.append_upload(uid, 0, b"abc"), 6)
+        self.assertEqual(self.store.append_upload(uid, 2, b"cd"), 6)
+        self.assertEqual(self.store.append_upload(uid, 0, b"abcdef"), 6)
+        self.assertEqual(self.store.upload_status(uid)["offset"], 6)
+
+    def test_different_bytes_within_received_range_fail(self):
+        uid = self.begin(b"abcdef")
+        self.store.append_upload(uid, 0, b"abcdef")
+        for offset, chunk in [(0, b"abcXXX"), (3, b"XXX"), (0, b"x")]:
+            with self.assertRaises(ObjectStoreError):
+                self.store.append_upload(uid, offset, chunk)
+        self.assertEqual(self.store.upload_status(uid)["offset"], 6)
+
+    def test_overlap_crossing_the_end_fails(self):
+        uid = self.begin(b"abcdef")
+        self.store.append_upload(uid, 0, b"abc")
+        with self.assertRaises(ObjectStoreError):
+            self.store.append_upload(uid, 2, b"cdef")
+        self.assertEqual(self.store.upload_status(uid)["offset"], 3)
+
+    def test_gap_past_the_end_fails(self):
+        uid = self.begin(b"abcdef")
+        with self.assertRaises(ObjectStoreError):
+            self.store.append_upload(uid, 2, b"cd")
+        self.store.append_upload(uid, 0, b"ab")
+        with self.assertRaises(ObjectStoreError):
+            self.store.append_upload(uid, 4, b"ef")
+        self.assertEqual(self.store.upload_status(uid)["offset"], 2)
+
+    def test_growth_past_declared_size_fails(self):
+        uid = self.begin(b"abc")
+        with self.assertRaises(ObjectStoreError):
+            self.store.append_upload(uid, 0, b"abcd")
+        self.assertEqual(self.store.append_upload(uid, 0, b"abc"), 3)
+        with self.assertRaises(ObjectStoreError):
+            self.store.append_upload(uid, 3, b"d")
+        self.assertEqual(self.store.upload_status(uid)["offset"], 3)
+
+    def test_empty_chunk_only_accepted_at_the_end(self):
+        uid = self.begin(b"abc")
+        self.assertEqual(self.store.append_upload(uid, 0, b""), 0)
+        self.store.append_upload(uid, 0, b"ab")
+        self.assertEqual(self.store.append_upload(uid, 2, b""), 2)
+        with self.assertRaises(ObjectStoreError):
+            self.store.append_upload(uid, 0, b"")
+        with self.assertRaises(ObjectStoreError):
+            self.store.append_upload(uid, 5, b"")
+        self.assertEqual(self.store.upload_status(uid)["offset"], 2)
+
+    def test_invalid_offset_and_payload_are_rejected(self):
+        uid = self.begin(b"abc")
+        for bad_offset in [-1, True, False, "0", None, 1.5]:
+            with self.assertRaises(ObjectStoreError):
+                self.store.append_upload(uid, bad_offset, b"a")
+        with self.assertRaises(ObjectStoreError):
+            self.store.append_upload(uid, 0, "not bytes")
+        self.assertEqual(self.store.upload_status(uid)["offset"], 0)
+
+    def test_append_to_unknown_session_fails(self):
+        with self.assertRaises(ObjectStoreError):
+            self.store.append_upload("b" * 32, 0, b"x")
+
+
+class TestCompleteUpload(StoreTestCase):
+    def begin(self, payload, key="k", content_type=None):
+        return self.store.begin_upload(key, len(payload), sha(payload),
+                                       content_type=content_type)
+
+    def test_complete_publishes_object_and_returns_put_metadata(self):
+        payload = b"hello world"
+        uid = self.begin(payload, key="docs/a.txt", content_type="text/plain")
+        self.store.append_upload(uid, 0, payload[:6])
+        self.store.append_upload(uid, 6, payload[6:])
+        entry = self.store.complete_upload(uid)
+        self.assertEqual(entry, {"sha256": sha(payload), "size": 11,
+                                 "content_type": "text/plain"})
+        self.assertEqual(self.store.get("docs/a.txt"), (payload, entry))
+        self.assertTrue(self.store.upload_status(uid)["completed"])
+
+    def test_incomplete_upload_is_rejected_and_progress_is_kept(self):
+        payload = b"not-all-here"
+        uid = self.begin(payload)
+        self.store.append_upload(uid, 0, payload[:4])
+        with self.assertRaises(ObjectStoreError):
+            self.store.complete_upload(uid)
+        status = self.store.upload_status(uid)
+        self.assertEqual(status["offset"], 4)
+        self.assertFalse(status["completed"])
+        with self.assertRaises(ObjectStoreError):
+            self.store.head("k")
+        # the session can still be finished afterwards
+        self.store.append_upload(uid, 4, payload[4:])
+        self.assertEqual(self.store.complete_upload(uid)["sha256"], sha(payload))
+
+    def test_hash_mismatch_is_rejected_and_publishes_nothing(self):
+        uid = self.store.begin_upload("k", 3, sha(b"abc"))
+        self.store.append_upload(uid, 0, b"xyz")
+        with self.assertRaises(ObjectStoreError):
+            self.store.complete_upload(uid)
+        with self.assertRaises(ObjectStoreError):
+            self.store.head("k")
+        self.assertEqual(self.store.blob_digests(), [])
+        self.assertFalse(self.store.upload_status(uid)["completed"])
+
+    def test_zero_byte_object_follows_the_same_rule(self):
+        uid = self.store.begin_upload("empty", 0, sha(b""))
+        entry = self.store.complete_upload(uid)
+        self.assertEqual(entry, {"sha256": sha(b""), "size": 0, "content_type": None})
+        self.assertEqual(self.store.get("empty"), (b"", entry))
+        # a zero-byte session with a wrong declared digest still fails
+        bad = self.store.begin_upload("bad", 0, sha(b"x"))
+        with self.assertRaises(ObjectStoreError):
+            self.store.complete_upload(bad)
+
+    def test_old_key_stays_readable_until_complete(self):
+        self.store.put("k", b"old")
+        payload = b"brand-new"
+        uid = self.begin(payload)
+        self.store.append_upload(uid, 0, payload)
+        self.assertEqual(self.store.get("k")[0], b"old")
+        self.store.complete_upload(uid)
+        self.assertEqual(self.store.get("k")[0], payload)
+
+    def test_incomplete_content_is_never_published(self):
+        payload = b"partial-content-only"
+        uid = self.begin(payload)
+        self.store.append_upload(uid, 0, payload[:7])
+        self.assertEqual(self.store.blob_digests(), [])
+        self.assertEqual(self.store.list_objects()["items"], [])
+
+    def test_append_after_complete_fails(self):
+        payload = b"done-already"
+        uid = self.begin(payload)
+        self.store.append_upload(uid, 0, payload)
+        self.store.complete_upload(uid)
+        with self.assertRaises(ObjectStoreError):
+            self.store.append_upload(uid, 0, payload)
+        with self.assertRaises(ObjectStoreError):
+            self.store.append_upload(uid, len(payload), b"")
+
+    def test_repeated_complete_returns_first_result_without_overwriting(self):
+        payload = b"completed-once"
+        uid = self.begin(payload)
+        self.store.append_upload(uid, 0, payload)
+        entry = self.store.complete_upload(uid)
+        self.assertEqual(self.store.complete_upload(uid), entry)
+        # a later put wins over a repeated complete
+        later = self.store.put("k", b"later")
+        self.assertEqual(self.store.complete_upload(uid), entry)
+        self.assertEqual(self.store.get("k"), (b"later", later))
+        # and so does a later delete
+        self.store.delete("k")
+        self.assertEqual(self.store.complete_upload(uid), entry)
+        with self.assertRaises(ObjectStoreError):
+            self.store.head("k")
+
+    def test_complete_unknown_session_fails(self):
+        with self.assertRaises(ObjectStoreError):
+            self.store.complete_upload("c" * 32)
+
+
+class TestAbortUpload(StoreTestCase):
+    def test_abort_removes_session_and_returns_none(self):
+        payload = b"abort-me"
+        uid = self.store.begin_upload("k", len(payload), sha(payload))
+        self.store.append_upload(uid, 0, payload[:3])
+        self.assertIsNone(self.store.abort_upload(uid))
+        for call in (self.store.upload_status, self.store.complete_upload,
+                     self.store.abort_upload):
+            with self.assertRaises(ObjectStoreError):
+                call(uid)
+        with self.assertRaises(ObjectStoreError):
+            self.store.append_upload(uid, 0, b"x")
+        self.assertEqual(os.listdir(self.store.uploads_dir), [])
+
+    def test_abort_after_complete_keeps_the_published_object(self):
+        payload = b"published-then-aborted"
+        uid = self.store.begin_upload("k", len(payload), sha(payload))
+        self.store.append_upload(uid, 0, payload)
+        entry = self.store.complete_upload(uid)
+        self.assertIsNone(self.store.abort_upload(uid))
+        self.assertEqual(self.store.get("k"), (payload, entry))
+        self.assertEqual(self.store.blob_digests(), [sha(payload)])
+        with self.assertRaises(ObjectStoreError):
+            self.store.upload_status(uid)
+
+
+class TestUploadPersistence(StoreTestCase):
+    def test_session_and_progress_survive_reopen(self):
+        payload = b"persistent-upload"
+        uid = self.store.begin_upload("k", len(payload), sha(payload),
+                                      content_type="text/plain")
+        self.store.append_upload(uid, 0, payload[:5])
+        reopened = ContentAddressedStore(self.root)
+        self.assertEqual(reopened.upload_status(uid), {
+            "key": "k", "size": len(payload), "sha256": sha(payload),
+            "content_type": "text/plain", "offset": 5, "completed": False,
+        })
+        self.assertEqual(reopened.append_upload(uid, 5, payload[5:]), len(payload))
+        entry = reopened.complete_upload(uid)
+        self.assertEqual(ContentAddressedStore(self.root).get("k"), (payload, entry))
+
+    def test_completed_flag_and_result_survive_reopen(self):
+        payload = b"completed-persistent"
+        uid = self.store.begin_upload("k", len(payload), sha(payload))
+        self.store.append_upload(uid, 0, payload)
+        entry = self.store.complete_upload(uid)
+        reopened = ContentAddressedStore(self.root)
+        status = reopened.upload_status(uid)
+        self.assertTrue(status["completed"])
+        self.assertEqual(status["offset"], len(payload))
+        self.assertEqual(reopened.complete_upload(uid), entry)
+
+    def test_interrupted_append_leaves_old_progress_or_whole_chunk(self):
+        payload = b"crash-during-append"
+        uid = self.store.begin_upload("k", len(payload), sha(payload))
+        self.store.append_upload(uid, 0, payload[:4])
+        # simulate a crash after the chunk bytes hit the file but before the
+        # new offset was recorded: stray bytes beyond the confirmed offset
+        data_path = os.path.join(self.store.uploads_dir, uid + ".data")
+        with open(data_path, "ab") as handle:
+            handle.write(b"stray-bytes")
+        reopened = ContentAddressedStore(self.root)
+        self.assertEqual(reopened.upload_status(uid)["offset"], 4)
+        self.assertEqual(reopened.append_upload(uid, 4, payload[4:]), len(payload))
+        self.assertEqual(reopened.complete_upload(uid)["sha256"], sha(payload))
+        self.assertEqual(reopened.get("k")[0], payload)
+
+    def test_data_shorter_than_recorded_offset_is_reported(self):
+        payload = b"truncated-session"
+        uid = self.store.begin_upload("k", len(payload), sha(payload))
+        self.store.append_upload(uid, 0, payload[:6])
+        data_path = os.path.join(self.store.uploads_dir, uid + ".data")
+        with open(data_path, "r+b") as handle:
+            handle.truncate(2)
+        with self.assertRaises(ObjectStoreError):
+            ContentAddressedStore(self.root).upload_status(uid)
+
+    def test_existing_directory_without_uploads_dir_works(self):
+        root = tempfile.mkdtemp(prefix="objstore-legacy-")
+        self.addCleanup(shutil.rmtree, root, True)
+        os.makedirs(os.path.join(root, "blobs"))
+        legacy = ContentAddressedStore(root)
+        legacy.put("old", b"layout")
+        store = ContentAddressedStore(root)
+        self.assertEqual(store.get("old")[0], b"layout")
+        payload = b"new-feature"
+        uid = store.begin_upload("k", len(payload), sha(payload))
+        store.append_upload(uid, 0, payload)
+        store.complete_upload(uid)
+        self.assertEqual(store.get("k")[0], payload)
+
+
+class TestUploadGarbageCollection(StoreTestCase):
+    def test_gc_preserves_incomplete_session_data(self):
+        payload = b"gc-protected-upload"
+        uid = self.store.begin_upload("k", len(payload), sha(payload))
+        self.store.append_upload(uid, 0, payload[:5])
+        self.assertEqual(self.store.collect_garbage(dry_run=False),
+                         {"digests": [], "bytes": 0, "dry_run": False})
+        self.assertEqual(self.store.upload_status(uid)["offset"], 5)
+        self.store.append_upload(uid, 5, payload[5:])
+        self.store.complete_upload(uid)
+        self.assertEqual(self.store.get("k")[0], payload)
+
+    def test_completion_record_does_not_block_collection(self):
+        payload = b"collect-after-complete"
+        uid = self.store.begin_upload("k", len(payload), sha(payload))
+        self.store.append_upload(uid, 0, payload)
+        self.store.complete_upload(uid)
+        self.store.delete("k")
+        result = self.store.collect_garbage(dry_run=False)
+        self.assertEqual(result, {"digests": [sha(payload)], "bytes": len(payload),
+                                  "dry_run": False})
+        # the completion record itself survives and stays truthful
+        self.assertTrue(self.store.upload_status(uid)["completed"])
+
+    def test_gc_after_abort_keeps_published_object(self):
+        payload = b"aborted-after-publish"
+        uid = self.store.begin_upload("k", len(payload), sha(payload))
+        self.store.append_upload(uid, 0, payload)
+        self.store.complete_upload(uid)
+        self.store.abort_upload(uid)
+        self.assertEqual(self.store.collect_garbage(dry_run=False),
+                         {"digests": [], "bytes": 0, "dry_run": False})
+        self.assertEqual(self.store.get("k")[0], payload)
+
+
+class TestUploadConcurrency(StoreTestCase):
+    def test_same_key_sessions_complete_in_completion_order(self):
+        first_payload, second_payload = b"first-content", b"second-content!"
+        first = self.store.begin_upload("k", len(first_payload), sha(first_payload))
+        second = self.store.begin_upload("k", len(second_payload), sha(second_payload))
+        self.store.append_upload(first, 0, first_payload)
+        self.store.append_upload(second, 0, second_payload)
+        self.store.complete_upload(second)
+        self.store.complete_upload(first)
+        self.assertEqual(self.store.get("k")[0], first_payload)
+        self.assertEqual(self.store.complete_upload(second)["sha256"], sha(second_payload))
+        self.assertEqual(self.store.get("k")[0], first_payload)
+
+    def test_concurrent_identical_appends_stay_consistent(self):
+        chunks = [b"chunk-%d;" % index for index in range(8)]
+        payload = b"".join(chunks)
+        uid = self.store.begin_upload("k", len(payload), sha(payload))
+        errors = []
+
+        def work():
+            try:
+                for index, chunk in enumerate(chunks):
+                    self.store.append_upload(uid, index * len(chunk), chunk)
+            except Exception as exc:  # pragma: no cover - failure path
+                errors.append(exc)
+
+        threads = [threading.Thread(target=work) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+        self.assertEqual(errors, [])
+        self.assertEqual(self.store.upload_status(uid)["offset"], len(payload))
+        self.store.complete_upload(uid)
+        self.assertEqual(self.store.get("k")[0], payload)
 
 
 class TestConcurrency(StoreTestCase):
