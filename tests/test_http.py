@@ -3,13 +3,14 @@
 import hashlib
 import http.client
 import json
+import os
 import shutil
 import tempfile
 import threading
 import unittest
 
 from objstore.http_app import create_server
-from objstore.store import ContentAddressedStore
+from objstore.store import CORRUPTED_BLOB, ContentAddressedStore
 
 
 def sha(payload):
@@ -200,6 +201,93 @@ class TestErrors(HTTPTestCase):
             conn.close()
         self.assertEqual(status, 411)
         self.assertEqual(self.document(body), {"error": "length required"})
+
+
+class TestIntegrityOverHTTP(HTTPTestCase):
+    KEY = "integrity/obj.bin"
+
+    def blob_path(self, digest):
+        return os.path.join(self.store.blobs_dir, digest)
+
+    def corrupt(self, digest, data=b"tampered-bytes"):
+        with open(self.blob_path(digest), "wb") as handle:
+            handle.write(data)
+
+    def test_corrupt_object_get_is_500_with_error_only(self):
+        payload = b"http integrity payload"
+        self.request("PUT", "/v1/objects/%s" % self.KEY, payload)
+        digest = sha(payload)
+        self.corrupt(digest, b"http tampered!!")
+
+        status, headers, body = self.request("GET", "/v1/objects/%s" % self.KEY)
+        self.assertEqual(status, 500)
+        self.assertEqual(headers["content-type"], "application/json")
+        self.assertEqual(self.document(body), {"error": CORRUPTED_BLOB})
+        self.assertNotIn(payload, body)
+
+        status, _, body = self.request("GET", "/v1/blobs/%s" % digest)
+        self.assertEqual(status, 500)
+        self.assertEqual(self.document(body), {"error": CORRUPTED_BLOB})
+
+    def test_truncation_append_and_same_length_flip_are_500(self):
+        payload = b"0123456789abcdef"
+        self.request("PUT", "/v1/objects/%s" % self.KEY, payload)
+        digest = sha(payload)
+        for tampered in (payload[:8], payload + b"x", payload[:-1] + b"X"):
+            self.corrupt(digest, tampered)
+            self.assertEqual(
+                self.request("GET", "/v1/objects/%s" % self.KEY)[0], 500)
+            self.assertEqual(self.request("GET", "/v1/blobs/%s" % digest)[0], 500)
+
+    def test_wrong_metadata_size_fails_object_get_but_not_blob_get(self):
+        payload = b"five5"
+        self.request("PUT", "/v1/objects/%s" % self.KEY, payload)
+        digest = sha(payload)
+        self.store._index["objects"][self.KEY]["size"] = 4
+        self.store._save_index()
+        try:
+            self.assertEqual(self.request("GET", "/v1/objects/%s" % self.KEY)[0], 500)
+            status, _, body = self.request("GET", "/v1/blobs/%s" % digest)
+            self.assertEqual((status, body), (200, payload))
+            # HEAD keeps serving metadata without reading content.
+            self.assertEqual(self.request("HEAD", "/v1/objects/%s" % self.KEY)[0], 200)
+        finally:
+            self.store._index["objects"][self.KEY]["size"] = len(payload)
+            self.store._save_index()
+
+    def test_reput_repairs_then_get_succeeds(self):
+        payload = b"repair me over http"
+        self.request("PUT", "/v1/objects/%s" % self.KEY, payload)
+        digest = sha(payload)
+        self.corrupt(digest, b"broken")
+        self.assertEqual(self.request("GET", "/v1/objects/%s" % self.KEY)[0], 500)
+
+        status, _, body = self.request("PUT", "/v1/objects/%s" % self.KEY, payload)
+        self.assertEqual(status, 200)  # same digest -> repeat PUT status preserved
+        self.assertEqual(self.document(body)["sha256"], digest)
+
+        status, _, body = self.request("GET", "/v1/objects/%s" % self.KEY)
+        self.assertEqual((status, body), (200, payload))
+        status, _, body = self.request("GET", "/v1/blobs/%s" % digest)
+        self.assertEqual((status, body), (200, payload))
+
+    def test_unreadable_blob_is_500_io_error(self):
+        payload = b"io error case"
+        self.request("PUT", "/v1/objects/%s" % self.KEY, payload)
+        digest = sha(payload)
+        path = self.blob_path(digest)
+        os.replace(path, path + ".keep")
+        os.mkdir(path)
+        try:
+            status, _, body = self.request("GET", "/v1/objects/%s" % self.KEY)
+            self.assertEqual(status, 500)
+            self.assertEqual(self.document(body), {"error": "blob io error"})
+            status, _, body = self.request("GET", "/v1/blobs/%s" % digest)
+            self.assertEqual(status, 500)
+            self.assertEqual(self.document(body), {"error": "blob io error"})
+        finally:
+            os.rmdir(path)
+            os.replace(path + ".keep", path)
 
 
 if __name__ == "__main__":

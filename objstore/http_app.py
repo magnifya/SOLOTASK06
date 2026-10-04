@@ -1,7 +1,7 @@
 """Standard-library HTTP front end for :class:`ContentAddressedStore`.
 
 Every failure is a single-line JSON body ``{"error": "..."}`` with status 400,
-404, 405 or 411.
+404, 405, 411 or 500.
 """
 
 from __future__ import annotations
@@ -12,7 +12,13 @@ import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
-from .store import DEFAULT_LIMIT, ContentAddressedStore, ObjectStoreError
+from .store import (
+    BLOB_IO_ERROR,
+    CORRUPTED_BLOB,
+    DEFAULT_LIMIT,
+    ContentAddressedStore,
+    ObjectStoreError,
+)
 
 __all__ = ["ObjectStoreHandler", "ObjectStoreHTTPServer", "create_server"]
 
@@ -24,6 +30,8 @@ _BAD_REQUEST_PREFIXES = (
     "invalid sha256", "invalid limit", "invalid key", "invalid prefix",
     "invalid after", "payload", "content_type",
 )
+#: Storage-side failures that never carry object bytes back to the caller.
+_SERVER_ERROR_MESSAGES = frozenset({CORRUPTED_BLOB, BLOB_IO_ERROR})
 
 
 def _json_bytes(payload):
@@ -31,6 +39,8 @@ def _json_bytes(payload):
 
 
 def _status_for(message):
+    if message in _SERVER_ERROR_MESSAGES:
+        return 500
     for prefix in _BAD_REQUEST_PREFIXES:
         if message.startswith(prefix):
             return 400

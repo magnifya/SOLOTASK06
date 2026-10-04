@@ -80,17 +80,21 @@ Errors are always JSON: `{"error": "..."}`. Unknown keys return
 `404 {"error":"not found"}`; a malformed digest returns
 `400 {"error":"invalid sha256"}`; an out-of-range or non-numeric `limit`
 returns `400 {"error":"invalid limit"}`; an unknown path returns
-`404 {"error":"not found"}`.
+`404 {"error":"not found"}`. A blob whose on-disk bytes no longer match its
+digest, or an object whose byte count disagrees with its metadata `size`,
+returns `500 {"error":"corrupted blob"}`; an unreadable blob file or a failed
+repair write returns `500 {"error":"blob io error"}`. Neither body ever
+contains object bytes.
 
 | Method | Path | Success | Error codes |
 | --- | --- | --- | --- |
-| GET | `/healthz` | 200 `{"ok": true}` | 405 |
-| PUT | `/v1/objects/{key}` | 201 `{"key","sha256","size"}` on first store; 200 with the same body when the same bytes are stored again | 400 invalid key, 411 missing Content-Length, 405 |
-| GET | `/v1/objects/{key}` | 200 raw bytes, headers `Content-Type` and `X-Content-Sha256` | 404 unknown key, 400 invalid key, 405 |
-| HEAD | `/v1/objects/{key}` | 200 no body, headers `Content-Length` and `X-Content-Sha256` | 404 unknown key, 400 invalid key, 405 |
+| GET | `/healthz` | 200 `{"ok": True}` | 405 |
+| PUT | `/v1/objects/{key}` | 201 `{"key","sha256","size"}` on first store; 200 with the same body when the same bytes are stored again. If the shared blob file is present but corrupt, the incoming bytes repair it atomically before the key is updated | 400 invalid key, 411 missing Content-Length, 500 blob io error, 405 |
+| GET | `/v1/objects/{key}` | 200 raw bytes, headers `Content-Type` and `X-Content-Sha256`; bytes are re-hashed on every read and must match the metadata `size` | 404 unknown key, 400 invalid key, 500 corrupted/blob io error, 405 |
+| HEAD | `/v1/objects/{key}` | 200 no body, headers `Content-Length` and `X-Content-Sha256` (metadata only; content is not read or verified) | 404 unknown key, 400 invalid key, 405 |
 | DELETE | `/v1/objects/{key}` | 204 no body | 404 unknown key, 400 invalid key, 405 |
-| GET | `/v1/objects?prefix=&after=&limit=` | 200 `{"items":[{"key","sha256","size","content_type"}],"next_after":<str or null>}` | 400 invalid limit, 400 invalid prefix, 400 invalid after, 405 |
-| GET | `/v1/blobs/{sha256}` | 200 raw bytes of that content, header `X-Content-Sha256` | 400 invalid sha256, 404 unknown digest, 405 |
+| GET | `/v1/objects?prefix=&after=&limit=` | 200 `{"items":[{"key","sha256","size","content_type"}],"next_after":<str or null>}` (metadata only) | 400 invalid limit, 400 invalid prefix, 400 invalid after, 405 |
+| GET | `/v1/blobs/{sha256}` | 200 raw bytes of that content, header `X-Content-Sha256`; the bytes are re-hashed and must equal the requested digest | 400 invalid sha256, 404 unknown/missing digest, 500 corrupted/blob io error, 405 |
 
 Notes:
 
@@ -101,6 +105,12 @@ Notes:
 * `limit` must be an integer between 1 and 1000.
 * Deleting a key removes only the metadata entry; blob bytes remain on disk
   because other keys may still reference the same digest.
+* Read failures never delete a blob or rewrite metadata. Re-putting the
+  original content of a corrupt blob restores every key that shares the digest
+  (keys whose own metadata `size` is wrong keep that metadata and still fail
+  `GET` until their metadata is corrected). Repair uses the same atomic
+  temp-file-plus-`os.replace` write as the index, so an interrupted repair
+  leaves either the old bytes or the complete new bytes, never a mix.
 
 ## Storage layout
 

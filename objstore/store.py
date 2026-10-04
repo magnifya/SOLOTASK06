@@ -4,6 +4,10 @@ Blob bytes are stored once as ``<root>/blobs/<sha256>``; object metadata
 (``key -> {sha256, size, content_type}``) lives in ``<root>/index.json`` and is
 always rewritten through a temporary file plus ``os.replace``. Every mutation
 and every consistent read runs under a single re-entrant lock.
+
+Every blob read is verified against its digest, so on-disk corruption is never
+served. A ``put`` whose target digest exists but is corrupt atomically repairs
+that blob from the incoming payload, restoring every key sharing the digest.
 """
 
 from __future__ import annotations
@@ -14,7 +18,12 @@ import os
 import re
 import threading
 
-__all__ = ["ContentAddressedStore", "ObjectStoreError"]
+__all__ = [
+    "ContentAddressedStore",
+    "ObjectStoreError",
+    "CORRUPTED_BLOB",
+    "BLOB_IO_ERROR",
+]
 
 INDEX_NAME = "index.json"
 BLOBS_DIRNAME = "blobs"
@@ -22,7 +31,15 @@ INDEX_VERSION = 1
 DEFAULT_LIMIT = 100
 MAX_LIMIT = 1000
 
+#: Raised when bytes on disk do not match their digest or metadata size.
+CORRUPTED_BLOB = "corrupted blob"
+#: Raised on an I/O failure against an existing blob file or a repair write.
+BLOB_IO_ERROR = "blob io error"
+
 _SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+
+# Sentinel distinguishing a missing blob file from corrupt/valid bytes.
+_BLOB_MISSING = object()
 
 
 class ObjectStoreError(Exception):
@@ -128,7 +145,12 @@ class ContentAddressedStore:
 
     # -- object API ----------------------------------------------------
     def put(self, key, payload, content_type=None):
-        """Store *payload* under *key* and return its metadata entry."""
+        """Store *payload* under *key* and return its metadata entry.
+
+        If the blob for the payload's digest is present but corrupt, it is
+        atomically repaired from *payload*; missing blobs are written as usual.
+        Repair failures leave both the blob and the object map untouched.
+        """
         self._check_key(key)
         if not isinstance(payload, (bytes, bytearray, memoryview)):
             raise ObjectStoreError("payload must be bytes")
@@ -139,17 +161,34 @@ class ContentAddressedStore:
         entry = {"sha256": sha, "size": len(data), "content_type": content_type}
         with self._lock:
             path = os.path.join(self.blobs_dir, sha)
-            if not os.path.exists(path):
-                _atomic_write(path, data)
+            needs_write = not os.path.exists(path)
+            if not needs_write:
+                raw = self._read_blob_raw(path)
+                if raw is _BLOB_MISSING:
+                    needs_write = True
+                elif hashlib.sha256(raw).hexdigest() != sha:
+                    # The shared blob exists but its bytes are corrupt; the
+                    # incoming payload is a complete, verified replacement.
+                    needs_write = True
+            if needs_write:
+                self._write_blob(path, data)
             self._index["objects"][key] = entry
             self._save_index()
             return dict(entry)
 
     def get(self, key):
-        """Return ``(payload, entry)`` for *key*."""
+        """Return ``(payload, entry)`` for *key*.
+
+        The blob digest must match and the byte count must equal the
+        metadata ``size``; otherwise :class:`ObjectStoreError` is raised with
+        ``corrupted blob``.
+        """
         with self._lock:
             entry = self.head(key)
-            return self.blob(entry["sha256"]), entry
+            data = self.blob(entry["sha256"])
+            if len(data) != entry["size"]:
+                raise ObjectStoreError(CORRUPTED_BLOB)
+            return data, entry
 
     def head(self, key):
         """Return a copy of the metadata entry for *key*."""
@@ -170,16 +209,49 @@ class ContentAddressedStore:
             self._save_index()
 
     def blob(self, sha256):
-        """Return the raw bytes stored under digest *sha256*."""
+        """Return the raw bytes stored under digest *sha256*.
+
+        The bytes are re-read and re-hashed on every call: if their digest
+        differs from *sha256* the caller gets ``ObjectStoreError("corrupted
+        blob")`` instead of the bytes. A read failure against an existing blob
+        file raises ``ObjectStoreError("blob io error")``.
+        """
         self._require_sha(sha256)
         with self._lock:
-            try:
-                with open(os.path.join(self.blobs_dir, sha256), "rb") as handle:
-                    return handle.read()
-            except FileNotFoundError:
+            path = os.path.join(self.blobs_dir, sha256)
+            raw = self._read_blob_raw(path)
+            if raw is _BLOB_MISSING:
                 raise ObjectStoreError("not found: blob %s" % (sha256,))
-            except OSError as exc:
-                raise ObjectStoreError("blob read failed: %s" % (exc,))
+            if hashlib.sha256(raw).hexdigest() != sha256:
+                raise ObjectStoreError(CORRUPTED_BLOB)
+            return raw
+
+    def _read_blob_raw(self, path):
+        """Read *path*, returning its bytes, or ``_BLOB_MISSING`` if absent.
+
+        An I/O error against a file that exists (or races away between the
+        existence check and the open) is reported as ``blob io error``.
+        """
+        try:
+            with open(path, "rb") as handle:
+                return handle.read()
+        except FileNotFoundError:
+            return _BLOB_MISSING
+        except OSError:
+            raise ObjectStoreError(BLOB_IO_ERROR)
+
+    def _write_blob(self, path, data):
+        """Atomically write *data* to a new or repaired blob, verifying first.
+
+        The destination keeps its old bytes unless the full new content has
+        been staged and ``os.replace`` succeeds, so an interrupted repair never
+        leaves partially written content. Callers only mutate the object map
+        after this returns, so a failed repair cannot change object mappings.
+        """
+        try:
+            _atomic_write(path, data)
+        except OSError:
+            raise ObjectStoreError(BLOB_IO_ERROR)
 
     def blob_digests(self):
         """Return the sorted digests currently present in the blob directory."""
