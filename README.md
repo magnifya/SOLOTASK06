@@ -41,6 +41,21 @@ curl -sS http://127.0.0.1:8080/v1/objects/a.txt
 curl -sS 'http://127.0.0.1:8080/v1/objects?prefix=&limit=100'
 ```
 
+Upload a large payload through a resumable HTTP session:
+
+```
+size=$(wc -c < big.bin)
+digest=$(sha256sum big.bin | cut -d' ' -f1)
+session=$(curl -sS -X POST http://127.0.0.1:8080/v1/uploads \
+  -d "{\"key\":\"docs/big.bin\",\"size\":$size,\"sha256\":\"$digest\"}" \
+  | sed 's/.*"session":"\([0-9a-f]*\)".*/\1')
+head -c 1048576 big.bin | curl -sS -X PUT \
+  "http://127.0.0.1:8080/v1/uploads/$session?offset=0" --data-binary @-
+tail -c +1048577 big.bin | curl -sS -X PUT \
+  "http://127.0.0.1:8080/v1/uploads/$session?offset=1048576" --data-binary @-
+curl -sS -X POST "http://127.0.0.1:8080/v1/uploads/$session/complete"
+```
+
 Use the command line interface instead of the server:
 
 ```
@@ -107,8 +122,8 @@ the `completed` flag always agrees with what was published. Sessions on the
 same key are independent and publish in completion order. Garbage collection
 never touches data needed by incomplete sessions; once a session completes or
 is aborted, its blob follows the normal object-reference rules and the
-completion record itself keeps nothing alive. The HTTP and command line
-interfaces are unchanged by this feature.
+completion record itself keeps nothing alive. The command line interface is
+unchanged by this feature; the HTTP session surface is documented below.
 
 `collect_garbage(dry_run=True)` returns
 `{"digests": [...], "bytes": <int>, "dry_run": <bool>}`: the digests sorted
@@ -144,11 +159,19 @@ Errors are always JSON: `{"error": "..."}`. Unknown keys return
 `404 {"error":"not found"}`; a malformed digest returns
 `400 {"error":"invalid sha256"}`; an out-of-range or non-numeric `limit`
 returns `400 {"error":"invalid limit"}`; an unknown path returns
-`404 {"error":"not found"}`. Every object GET and blob GET recomputes the
-SHA-256 of the bytes actually on disk before serving them; object GET also
+`404 {"error":"not found"}`. Upload session conflicts (gaps, bytes past the
+received end or the declared size, conflicting re-sends, empty chunks away
+from the end, appending after completion, or completing with the wrong length
+or hash) return `409` and never change progress or the target object; a
+missing, non-integer or negative `Content-Length` on session creation or
+chunk append returns `411 {"error":"length required"}`; a request carrying
+`Transfer-Encoding` returns `400` and a body shorter than its declared
+`Content-Length` also returns `400`. Every object GET and blob GET recomputes
+the SHA-256 of the bytes actually on disk before serving them; object GET also
 checks the byte count against the metadata `size`. A failed check returns
 `500 {"error":"corrupted blob"}` with no object bytes, and an I/O error on an
-existing blob returns `500 {"error":"blob io error"}`. Re-PUTting an object
+existing blob returns `500 {"error":"blob io error"}`; upload session I/O
+failures return `500 {"error":"upload io error"}`. Re-PUTting an object
 whose digest file is corrupted restores that file atomically from the complete
 request body, which also repairs every other key sharing that digest; HEAD,
 listings and digest listings remain metadata-only and perform no content
@@ -163,6 +186,11 @@ checks.
 | DELETE | `/v1/objects/{key}` | 204 no body | 404 unknown key, 400 invalid key, 405 |
 | GET | `/v1/objects?prefix=&after=&limit=` | 200 `{"items":[{"key","sha256","size","content_type"}],"next_after":<str or null>}` | 400 invalid limit, 400 invalid prefix, 400 invalid after, 405 |
 | GET | `/v1/blobs/{sha256}` | 200 raw bytes of that content, header `X-Content-Sha256` | 400 invalid sha256, 404 unknown digest, 405, 500 corrupted blob / blob io error |
+| POST | `/v1/uploads` | 201 `{"session":"<id>"}`; body is a UTF-8 JSON object with required `key`, `size`, `sha256` and optional `content_type` (default `null`) | 400 invalid json / fields, 411 missing/non-integer/negative Content-Length, 400 Transfer-Encoding / truncated body, 405, 500 upload io error |
+| GET | `/v1/uploads/{session}` | 200 `{"key","size","sha256","content_type","offset","completed"}` | 404 unknown or aborted session, 405 |
+| PUT | `/v1/uploads/{session}?offset=<n>` | 200 `{"offset":<confirmed length>}`; body holds the raw chunk bytes and `offset` must be a unique non-negative decimal integer | 400 invalid/truncated framing, 404 unknown or aborted session, 409 gap/overlap/overflow/conflict/empty-chunk/completed, 411 missing/non-integer/negative Content-Length, 405, 500 upload io error |
+| POST | `/v1/uploads/{session}/complete` | 200 `{"sha256","size","content_type"}` (the first result on repeat completion); no body required | 404 unknown or aborted session, 409 incomplete or hash mismatch, 400 bad framing, 405, 500 blob/upload io error |
+| DELETE | `/v1/uploads/{session}` | 204 no body; aborts the session and keeps any published object | 404 unknown or aborted session, 405 |
 
 Notes:
 
@@ -176,6 +204,32 @@ Notes:
   default, `gc --execute` to delete) to remove the blobs no object references.
   The success line is
   `{"ok":true,"digests":[...],"bytes":<int>,"dry_run":<bool>}`.
+
+Upload session notes:
+
+* `POST /v1/uploads` validates exactly like `begin_upload`: `key` is a
+  non-empty slash-separated name without `.`/`..` parts or NUL bytes, `size`
+  a non-negative JSON integer (booleans rejected), `sha256` 64 lowercase hex
+  digits, and `content_type` a string when present. Extra fields are rejected.
+  Creating a session never creates or changes an object.
+* `PUT` appends follow the same rules as `append_upload`: a chunk must start
+  at the current received end and may not run past the declared size; a chunk
+  fully inside the received range succeeds at 200 without growing progress
+  when its bytes match and gets 409 otherwise; empty chunks are accepted only
+  at the current end. The 200 body always reports the confirmed length.
+* Completing publishes the object only when the received length and the
+  SHA-256 of the full content match (zero-byte objects included); repeating
+  completion of the same session returns the first result without
+  overwriting later writes or deletes of the key. Sessions on the same key
+  publish in completion order; aborting a session keeps the object it
+  published.
+* Session state lives in the same on-disk files as the Python API, so a
+  session created through one entry can be appended to, completed, inspected
+  or aborted through the other, and progress survives a server restart.
+* Session requests are framed strictly by `Content-Length`; chunked request
+  bodies are never accepted. A `GET`/`DELETE` status or abort call needs no
+  body, but any `Content-Length` it sends must be a valid non-negative
+  decimal integer and the declared bytes are consumed.
 
 ## Storage layout
 
@@ -195,6 +249,6 @@ versioning and retention policies, lifecycle policies on top of the existing
 garbage collection of unreferenced blobs, quotas and rate limiting, consistent
 hashing and rebalancing, erasure coding and repair, signed URLs and access
 control, cross-region replication and end-to-end audit logging. Resumable
-uploads exist only in the Python API; the HTTP and command line surfaces do
-not expose them yet. Authentication is out of scope: the server trusts every
-caller.
+uploads are exposed through the Python API and the HTTP surface; the command
+line interface does not expose them yet. Authentication is out of scope: the
+server trusts every caller.

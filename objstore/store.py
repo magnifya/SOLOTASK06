@@ -23,7 +23,7 @@ import stat
 import threading
 import uuid
 
-__all__ = ["ContentAddressedStore", "ObjectStoreError"]
+__all__ = ["ContentAddressedStore", "ObjectStoreError", "SessionConflict"]
 
 INDEX_NAME = "index.json"
 BLOBS_DIRNAME = "blobs"
@@ -39,6 +39,15 @@ _MISSING = object()
 
 class ObjectStoreError(Exception):
     """Missing object, invalid key/digest/limit, or a corrupted index."""
+
+
+class SessionConflict(ObjectStoreError):
+    """An upload operation that violates the session's current state.
+
+    A subclass of :class:`ObjectStoreError`, so existing callers keep
+    catching it; front ends (HTTP) can nevertheless distinguish these
+    state conflicts from bad input and report them separately.
+    """
 
 
 def _is_sha256(value):
@@ -411,7 +420,8 @@ class ContentAddressedStore:
     def _require_active_session(self, session_id):
         self._check_session_id(session_id)
         if session_id in self._upload_records:
-            raise ObjectStoreError("upload session already completed: %s" % (session_id,))
+            raise SessionConflict(
+                "upload session already completed: %s" % (session_id,))
         session = self._uploads.get(session_id)
         if session is None:
             raise ObjectStoreError("unknown upload session: %r" % (session_id,))
@@ -488,21 +498,21 @@ class ContentAddressedStore:
             session = self._require_active_session(session_id)
             current = session["offset"]
             if offset > current:
-                raise ObjectStoreError(
+                raise SessionConflict(
                     "append gap: offset %d beyond received %d" % (offset, current))
             if not data:
                 if offset != current:
-                    raise ObjectStoreError("empty chunk only at received end")
+                    raise SessionConflict("empty chunk only at received end")
                 return current
             end = offset + len(data)
             if offset < current:
                 if end > current:
-                    raise ObjectStoreError("append overlaps received end")
+                    raise SessionConflict("append overlaps received end")
                 if self._read_part(session_id, offset, len(data)) != data:
-                    raise ObjectStoreError("append conflicts with received bytes")
+                    raise SessionConflict("append conflicts with received bytes")
                 return current
             if end > session["size"]:
-                raise ObjectStoreError("append exceeds declared size")
+                raise SessionConflict("append exceeds declared size")
             self._write_part(session_id, offset, data)
             self._save_session(session_id, dict(session, offset=end))
             session["offset"] = end
@@ -526,14 +536,14 @@ class ContentAddressedStore:
             if session is None:
                 raise ObjectStoreError("unknown upload session: %r" % (session_id,))
             if session["offset"] != session["size"]:
-                raise ObjectStoreError(
+                raise SessionConflict(
                     "upload incomplete: %d of %d bytes received"
                     % (session["offset"], session["size"]))
             data = self._read_part(session_id, 0, session["size"])
             if len(data) != session["size"]:
                 raise ObjectStoreError("upload io error")
             if hashlib.sha256(data).hexdigest() != session["sha256"]:
-                raise ObjectStoreError("upload hash mismatch")
+                raise SessionConflict("upload hash mismatch")
             entry = {"sha256": session["sha256"], "size": session["size"],
                      "content_type": session["content_type"]}
             self._store_blob(session["sha256"], data)
