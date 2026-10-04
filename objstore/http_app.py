@@ -1,7 +1,8 @@
 """Standard-library HTTP front end for :class:`ContentAddressedStore`.
 
 Every failure is a single-line JSON body ``{"error": "..."}`` with status 400,
-404, 405, 411 or 500 (500 for a corrupted blob or a blob I/O error).
+404, 405, 409, 411 or 500 (500 for a corrupted blob/upload or a backing I/O
+error).
 """
 
 from __future__ import annotations
@@ -19,11 +20,29 @@ __all__ = ["ObjectStoreHandler", "ObjectStoreHTTPServer", "create_server"]
 _SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 _OBJECTS_PATH = "/v1/objects"
 _BLOBS_PATH = "/v1/blobs"
+_UPLOADS_PATH = "/v1/uploads"
+_COMPLETE_SUFFIX = "/complete"
 _DEFAULT_CONTENT_TYPE = "application/octet-stream"
 _BAD_REQUEST_PREFIXES = (
     "invalid sha256", "invalid limit", "invalid key", "invalid prefix",
-    "invalid after", "payload", "content_type",
+    "invalid after", "invalid size", "invalid offset",
+    "payload", "content_type",
 )
+_CONFLICT_PREFIXES = (
+    "append gap", "append overlaps", "append conflicts", "append exceeds",
+    "empty chunk", "upload incomplete", "upload hash mismatch",
+    "upload session already completed",
+)
+_SERVER_ERROR_PREFIXES = (
+    "corrupted blob", "blob io error", "upload io error",
+    "corrupted upload session",
+)
+_OFFSET_RE = re.compile(r"\A[0-9]+\Z")
+
+# Sentinels for the framed-body readers; real bodies are always ``bytes``.
+_TE_UNSUPPORTED = object()
+_LENGTH_REQUIRED = object()
+_BODY_ENDED_EARLY = object()
 
 
 def _json_bytes(payload):
@@ -31,11 +50,15 @@ def _json_bytes(payload):
 
 
 def _status_for(message):
-    if message == "corrupted blob" or message == "blob io error":
-        return 500
+    for prefix in _SERVER_ERROR_PREFIXES:
+        if message.startswith(prefix):
+            return 500
     for prefix in _BAD_REQUEST_PREFIXES:
         if message.startswith(prefix):
             return 400
+    for prefix in _CONFLICT_PREFIXES:
+        if message.startswith(prefix):
+            return 409
     return 404
 
 
@@ -74,11 +97,36 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
             return None
         return self.rfile.read(length) if length else b""
 
+    def _read_required_body(self):
+        """Read a body that must use Content-Length framing.
+
+        Returns the received bytes or one of the framing sentinels: a
+        Transfer-Encoding header wins over everything else, a missing,
+        non-integer or negative Content-Length means length required, and a
+        connection that ends before the declared length means a bad request.
+        """
+        if self.headers.get("Transfer-Encoding") is not None:
+            return _TE_UNSUPPORTED
+        raw = self.headers.get("Content-Length")
+        try:
+            length = int(raw)
+        except (TypeError, ValueError):
+            return _LENGTH_REQUIRED
+        if length < 0:
+            return _LENGTH_REQUIRED
+        data = self.rfile.read(length) if length else b""
+        if len(data) != length:
+            return _BODY_ENDED_EARLY
+        return data
+
     def do_GET(self):
         self._dispatch("GET")
 
     def do_HEAD(self):
         self._dispatch("HEAD")
+
+    def do_POST(self):
+        self._dispatch("POST")
 
     def do_PUT(self):
         self._dispatch("PUT")
@@ -103,6 +151,18 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
                 if method != "GET":
                     return self._error(405, "method not allowed")
                 return self._blob(unquote(path[len(_BLOBS_PATH) + 1:]))
+            if path == _UPLOADS_PATH:
+                return self._uploads_collection(method)
+            if path.startswith(_UPLOADS_PATH + "/"):
+                remainder = unquote(path[len(_UPLOADS_PATH) + 1:])
+                if not remainder:
+                    return self._error(404, "not found")
+                if remainder.endswith(_COMPLETE_SUFFIX):
+                    session_id = remainder[:-len(_COMPLETE_SUFFIX)]
+                    if session_id:
+                        return self._upload_complete(method, session_id)
+                return self._upload_session(method, remainder,
+                                            urlparse(self.path).query)
             return self._error(404, "not found")
         except ObjectStoreError as exc:
             return self._error(_status_for(str(exc)), str(exc))
@@ -158,6 +218,69 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
             raise ObjectStoreError("invalid sha256: %r" % (sha256,))
         return self._send(200, self.server.store.blob(sha256), _DEFAULT_CONTENT_TYPE,
                           [("X-Content-Sha256", sha256)])
+
+    # -- resumable uploads ---------------------------------------------
+    def _uploads_collection(self, method):
+        if method != "POST":
+            return self._error(405, "method not allowed")
+        body = self._read_required_body()
+        if body is _TE_UNSUPPORTED:
+            return self._error(400, "transfer-encoding not supported")
+        if body is _LENGTH_REQUIRED:
+            return self._error(411, "length required")
+        if body is _BODY_ENDED_EARLY:
+            return self._error(400, "request body ended early")
+        try:
+            document = json.loads(body.decode("utf-8"))
+        except UnicodeDecodeError:
+            return self._error(400, "invalid utf-8 body")
+        except ValueError:
+            return self._error(400, "invalid json body")
+        if not isinstance(document, dict):
+            return self._error(400, "invalid upload declaration")
+        try:
+            key = document["key"]
+            size = document["size"]
+            sha256 = document["sha256"]
+        except KeyError:
+            return self._error(400, "invalid upload declaration")
+        session_id = self.server.store.begin_upload(
+            key, size, sha256, document.get("content_type"))
+        return self._send(201, _json_bytes({"session": session_id}))
+
+    def _upload_session(self, method, session_id, query):
+        if method == "GET":
+            status = self.server.store.upload_status(session_id)
+            return self._send(200, _json_bytes(status))
+        if method == "PUT":
+            body = self._read_required_body()
+            if body is _TE_UNSUPPORTED:
+                return self._error(400, "transfer-encoding not supported")
+            if body is _LENGTH_REQUIRED:
+                return self._error(411, "length required")
+            if body is _BODY_ENDED_EARLY:
+                return self._error(400, "request body ended early")
+            offset = self._parse_offset(query)
+            end = self.server.store.append_upload(session_id, offset, body)
+            return self._send(200, _json_bytes({"offset": end}))
+        if method == "DELETE":
+            self.server.store.abort_upload(session_id)
+            return self._send(204, b"")
+        return self._error(405, "method not allowed")
+
+    def _upload_complete(self, method, session_id):
+        if method != "POST":
+            return self._error(405, "method not allowed")
+        entry = self.server.store.complete_upload(session_id)
+        return self._send(200, _json_bytes(entry))
+
+    @staticmethod
+    def _parse_offset(query):
+        params = parse_qs(query, keep_blank_values=True)
+        values = params.get("offset")
+        if not values or len(values) != 1 or _OFFSET_RE.match(values[0]) is None:
+            raise ObjectStoreError("invalid offset: %r" % (query,))
+        return int(values[0])
 
 
 class ObjectStoreHTTPServer(ThreadingHTTPServer):

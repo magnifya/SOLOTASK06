@@ -107,8 +107,52 @@ the `completed` flag always agrees with what was published. Sessions on the
 same key are independent and publish in completion order. Garbage collection
 never touches data needed by incomplete sessions; once a session completes or
 is aborted, its blob follows the normal object-reference rules and the
-completion record itself keeps nothing alive. The HTTP and command line
-interfaces are unchanged by this feature.
+completion record itself keeps nothing alive. The command line interface is
+unchanged by this feature; the HTTP session surface is described below.
+
+The same sessions are available over HTTP, and a session started through
+either entry point can be continued through the other:
+
+```
+curl -sS -X POST http://127.0.0.1:8080/v1/uploads \
+  -H 'Content-Type: application/json' \
+  -d '{"key":"docs/big.bin","size":1234,"sha256":"<64 hex>",
+       "content_type":"application/octet-stream"}'
+# -> 201 {"session":"<id>"}
+curl -sS -X PUT --data-binary @chunk0 \
+  'http://127.0.0.1:8080/v1/uploads/<id>?offset=0'   # -> 200 {"offset":<received>}
+curl -sS http://127.0.0.1:8080/v1/uploads/<id>       # -> 200 session status
+curl -sS -X POST http://127.0.0.1:8080/v1/uploads/<id>/complete
+curl -sS -X DELETE http://127.0.0.1:8080/v1/uploads/<id>   # -> 204, object kept
+```
+
+`POST /v1/uploads` takes a UTF-8 JSON object with required string `key`,
+integer `size` and string `sha256`, and an optional `content_type` that
+defaults to `null`; validation follows `begin_upload` exactly. It returns
+`201 {"session": "<id>"}` without changing any object. `GET` on a session
+returns the same status document as `upload_status`. `PUT` takes the chunk
+bytes as the raw body with exactly one non-negative decimal integer `offset`
+query parameter and returns `200 {"offset": <confirmed length>}`; the same
+append rules as `append_upload` apply, so an identical re-send fully inside
+the received range does not grow progress, while gaps, chunks overlapping or
+reaching past the end, chunks exceeding the declared size, conflicting
+re-sends, empty chunks anywhere but the current end and appends after
+completion all return `409` without changing progress or any object.
+`POST .../complete` takes no body and returns the put-style metadata with
+`200`; completing an under-length session or one whose content hash does not
+match returns `409`, a zero-byte object can complete immediately, and
+repeating completion returns the first result without overwriting later
+writes or deletes of the key. `DELETE` aborts the session with `204` and an
+empty body; published objects are always kept.
+
+Create and append requests must use `Content-Length`: a missing,
+non-integer or negative value is `411`. A `Transfer-Encoding` header makes
+the request `400` (it takes priority), and a body that ends before the
+declared length is also `400`. Invalid UTF-8, invalid JSON, malformed
+declaration fields and a bad `offset` are `400`; none of these change
+anything. Unknown or aborted sessions are `404`, and a known path with an
+unopened method is `405`. Upload or blob I/O failures return `500`. Every
+error body is `{"error": "..."}` and nothing else.
 
 `collect_garbage(dry_run=True)` returns
 `{"digests": [...], "bytes": <int>, "dry_run": <bool>}`: the digests sorted
@@ -163,11 +207,22 @@ checks.
 | DELETE | `/v1/objects/{key}` | 204 no body | 404 unknown key, 400 invalid key, 405 |
 | GET | `/v1/objects?prefix=&after=&limit=` | 200 `{"items":[{"key","sha256","size","content_type"}],"next_after":<str or null>}` | 400 invalid limit, 400 invalid prefix, 400 invalid after, 405 |
 | GET | `/v1/blobs/{sha256}` | 200 raw bytes of that content, header `X-Content-Sha256` | 400 invalid sha256, 404 unknown digest, 405, 500 corrupted blob / blob io error |
+| POST | `/v1/uploads` | 201 `{"session"}` | 400 bad UTF-8/JSON/declaration, 411 missing/invalid Content-Length, 405, 500 upload io error |
+| GET | `/v1/uploads/{session}` | 200 `{"key","size","sha256","content_type","offset","completed"}` | 404 unknown/aborted session, 405 |
+| PUT | `/v1/uploads/{session}?offset=n` | 200 `{"offset"}` confirmed length | 400 bad offset/framing, 404 unknown session, 409 gap/overlap/conflict/too large/empty away from end/completed, 411, 500 upload io error |
+| POST | `/v1/uploads/{session}/complete` | 200 `{"sha256","size","content_type"}` (first result on repeat) | 404 unknown session, 405, 409 incomplete or hash mismatch, 500 blob/upload io error |
+| DELETE | `/v1/uploads/{session}` | 204 no body; published object kept | 404 unknown/aborted session, 405 |
 
 Notes:
 
 * `PUT` reads exactly `Content-Length` bytes from the request body; chunked
-  request bodies are not supported.
+  request bodies are not supported. The upload create and append requests
+  have the same requirement: `Transfer-Encoding` is rejected with `400`,
+  missing/non-integer/negative `Content-Length` with `411`, and a body that
+  ends before the declared length with `400`.
+* Upload sessions are shared between the Python API and HTTP: a session id
+  from `begin_upload` is the same string used at `/v1/uploads/{session}`,
+  so either entry point can append, complete, query or abort it.
 * `after` is an exclusive lower bound on the key, so the `next_after` value of a
   page can be passed straight back as `after` to fetch the next page.
 * `limit` must be an integer between 1 and 1000.
@@ -194,7 +249,6 @@ The following long-term goals are intentionally not implemented yet: object
 versioning and retention policies, lifecycle policies on top of the existing
 garbage collection of unreferenced blobs, quotas and rate limiting, consistent
 hashing and rebalancing, erasure coding and repair, signed URLs and access
-control, cross-region replication and end-to-end audit logging. Resumable
-uploads exist only in the Python API; the HTTP and command line surfaces do
-not expose them yet. Authentication is out of scope: the server trusts every
-caller.
+control, cross-region replication and end-to-end audit logging. The command
+line surface does not expose resumable uploads yet. Authentication is out of
+scope: the server trusts every caller.
