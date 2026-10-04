@@ -83,5 +83,85 @@ class TestGetIntegrity(CLITestCase):
             self.assertEqual(handle.read(), payload)
 
 
+class TestGarbageCollection(CLITestCase):
+    def blob_path(self, digest):
+        return os.path.join(self.data_dir, "blobs", digest)
+
+    def test_preview_on_empty_store(self):
+        proc = self.run_cli("gc")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, b"")
+        self.assertEqual(proc.stdout.count(b"\n"), 1)
+        self.assertEqual(json.loads(proc.stdout.decode("utf-8")),
+                         {"ok": True, "digests": [], "bytes": 0, "dry_run": True})
+
+    def test_preview_then_execute(self):
+        source = os.path.join(self.tmp, "a.bin")
+        with open(source, "wb") as handle:
+            handle.write(b"gc-cli-payload")
+        self.assertEqual(self.run_cli("put", "--key", "a", "--file", source).returncode, 0)
+        digest = sha(b"gc-cli-payload")
+        self.assertEqual(self.run_cli("delete", "--key", "a").returncode, 0)
+
+        proc = self.run_cli("gc")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(json.loads(proc.stdout.decode("utf-8")),
+                         {"ok": True, "digests": [digest],
+                          "bytes": len(b"gc-cli-payload"), "dry_run": True})
+        self.assertTrue(os.path.exists(self.blob_path(digest)))
+
+        proc = self.run_cli("gc", "--execute")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(json.loads(proc.stdout.decode("utf-8")),
+                         {"ok": True, "digests": [digest],
+                          "bytes": len(b"gc-cli-payload"), "dry_run": False})
+        self.assertFalse(os.path.exists(self.blob_path(digest)))
+
+        proc = self.run_cli("gc", "--execute")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(json.loads(proc.stdout.decode("utf-8")),
+                         {"ok": True, "digests": [], "bytes": 0, "dry_run": False})
+
+    def test_execute_keeps_referenced_shared_and_non_blob_names(self):
+        source = os.path.join(self.tmp, "s.bin")
+        with open(source, "wb") as handle:
+            handle.write(b"shared")
+        self.assertEqual(self.run_cli("put", "--key", "a", "--file", source).returncode, 0)
+        self.assertEqual(self.run_cli("put", "--key", "b", "--file", source).returncode, 0)
+        digest = sha(b"shared")
+        orphan = sha(b"orphan")
+        self.write_blob(orphan, b"orphan")
+        with open(os.path.join(self.data_dir, "blobs", "%s.tmp.1.2" % orphan),
+                  "wb") as handle:
+            handle.write(b"partial")
+        with open(os.path.join(self.data_dir, "blobs", "notes.txt"), "wb") as handle:
+            handle.write(b"keep me")
+
+        proc = self.run_cli("gc", "--execute")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(json.loads(proc.stdout.decode("utf-8"))["digests"], [orphan])
+        self.assertTrue(os.path.exists(self.blob_path(digest)))
+        self.assertTrue(os.path.exists(
+            os.path.join(self.data_dir, "blobs", "%s.tmp.1.2" % orphan)))
+        self.assertTrue(os.path.exists(
+            os.path.join(self.data_dir, "blobs", "notes.txt")))
+        self.assertFalse(os.path.exists(self.blob_path(orphan)))
+
+    def test_io_failure_is_one_line_of_json_and_nonzero_exit(self):
+        if os.geteuid() == 0:
+            self.skipTest("root bypasses directory permissions")
+        blobs = os.path.join(self.data_dir, "blobs")
+        os.chmod(blobs, 0)
+        try:
+            proc = self.run_cli("gc", "--execute")
+        finally:
+            os.chmod(blobs, 0o755)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, b"")
+        self.assertEqual(proc.stderr.count(b"\n"), 1)
+        self.assertEqual(json.loads(proc.stderr.decode("utf-8")),
+                         {"ok": False, "error": "gc io error"})
+
+
 if __name__ == "__main__":
     unittest.main()

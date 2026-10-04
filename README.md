@@ -48,6 +48,8 @@ python3 -m objstore --data-dir ./objstore_data put --key docs/a.txt --file ./a.t
 python3 -m objstore --data-dir ./objstore_data get --key docs/a.txt --out ./copy.txt
 python3 -m objstore --data-dir ./objstore_data list --prefix docs/ --limit 100
 python3 -m objstore --data-dir ./objstore_data delete --key docs/a.txt
+python3 -m objstore --data-dir ./objstore_data gc
+python3 -m objstore --data-dir ./objstore_data gc --execute
 ```
 
 The global `--data-dir` option must appear before the subcommand; it defaults to
@@ -64,7 +66,29 @@ store = ContentAddressedStore("./objstore_data")
 entry = store.put("docs/a.txt", b"hello", content_type="text/plain")
 payload, head = store.get("docs/a.txt")
 page = store.list_objects(prefix="docs/", after=None, limit=100)
+result = store.collect_garbage()              # preview only
+store.collect_garbage(dry_run=False)          # actually delete
 ```
+
+`collect_garbage(dry_run=True)` returns
+`{"digests": [...], "bytes": <int>, "dry_run": <bool>}`: the digests sorted
+lexicographically and the sum of the files' actual byte sizes (zero-byte
+blobs included). A dry run reports the candidates and changes nothing;
+`dry_run=False` deletes the candidates and reports what that call removed.
+References are recomputed from the current index on every call, so content
+still shared by any key is kept, while content orphaned by an overwrite, by
+deleting the last reference, or never indexed at all is collectable. Only
+regular files directly in `blobs/` whose names are 64 lowercase hex digits
+are eligible; other names, temporary files, subdirectories and symlinks are
+preserved and symlink targets are never followed. Unreferenced files are
+deleted without validating their content, and missing or corrupted blobs
+that are still referenced do not block other candidates. A non-boolean
+`dry_run` raises `ObjectStoreError("invalid dry_run")`, and any scanning,
+stating or deletion I/O failure raises `ObjectStoreError("gc io error")`; a
+failed scan deletes nothing, and a failure mid-deletion leaves the completed
+deletions in place so a retry collects the rest. Garbage collection runs
+under the same lock as object reads and writes within one store instance.
+
 
 ## Tests
 
@@ -108,7 +132,10 @@ Notes:
   page can be passed straight back as `after` to fetch the next page.
 * `limit` must be an integer between 1 and 1000.
 * Deleting a key removes only the metadata entry; blob bytes remain on disk
-  because other keys may still reference the same digest.
+  because other keys may still reference the same digest. Run `gc` (preview by
+  default, `gc --execute` to delete) to remove the blobs no object references.
+  The success line is
+  `{"ok":true,"digests":[...],"bytes":<int>,"dry_run":<bool>}`.
 
 ## Storage layout
 
@@ -121,8 +148,8 @@ Notes:
 ## Limits of this seed
 
 The following long-term goals are intentionally not implemented yet: chunked and
-resumable uploads, object versioning and retention policies, lifecycle and
-garbage collection of unreferenced blobs, quotas and rate limiting, consistent
-hashing and rebalancing, erasure coding and repair, signed URLs and access
-control, cross-region replication and end-to-end audit logging. Authentication
-is out of scope: the server trusts every caller.
+resumable uploads, object versioning and retention policies, lifecycle policies
+on top of the existing garbage collection of unreferenced blobs, quotas and
+rate limiting, consistent hashing and rebalancing, erasure coding and repair,
+signed URLs and access control, cross-region replication and end-to-end audit
+logging. Authentication is out of scope: the server trusts every caller.
