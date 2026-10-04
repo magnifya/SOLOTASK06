@@ -4,6 +4,13 @@ Blob bytes are stored once as ``<root>/blobs/<sha256>``; object metadata
 (``key -> {sha256, size, content_type}``) lives in ``<root>/index.json`` and is
 always rewritten through a temporary file plus ``os.replace``. Every mutation
 and every consistent read runs under a single re-entrant lock.
+
+Resumable uploads live under ``<root>/uploads/`` (created lazily): each
+session is a ``<session>.json`` declaration plus confirmed offset and a
+``<session>.part`` file holding the received bytes. Completing a session
+publishes the object and records the result in the index's ``uploads`` map in
+one atomic index rewrite, so the completion flag can never disagree with the
+published object.
 """
 
 from __future__ import annotations
@@ -14,16 +21,20 @@ import os
 import re
 import stat
 import threading
+import uuid
 
 __all__ = ["ContentAddressedStore", "ObjectStoreError"]
 
 INDEX_NAME = "index.json"
 BLOBS_DIRNAME = "blobs"
+UPLOADS_DIRNAME = "uploads"
 INDEX_VERSION = 1
 DEFAULT_LIMIT = 100
 MAX_LIMIT = 1000
 
 _SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+_SESSION_META_RE = re.compile(r"\A([0-9a-f]{32})\.json\Z")
+_MISSING = object()
 
 
 class ObjectStoreError(Exception):
@@ -59,15 +70,17 @@ class ContentAddressedStore:
             raise ObjectStoreError("invalid root: %r" % (root,))
         self.root = os.path.abspath(os.fspath(root))
         self.blobs_dir = os.path.join(self.root, BLOBS_DIRNAME)
+        self.uploads_dir = os.path.join(self.root, UPLOADS_DIRNAME)
         self.index_path = os.path.join(self.root, INDEX_NAME)
         self._lock = threading.RLock()
         os.makedirs(self.blobs_dir, exist_ok=True)
-        self._index = self._load_index()
+        self._index, self._upload_records = self._load_index()
+        self._uploads = self._load_uploads()
 
     # -- index ---------------------------------------------------------
     def _load_index(self):
         if not os.path.exists(self.index_path):
-            return {"version": INDEX_VERSION, "objects": {}}
+            return {"version": INDEX_VERSION, "objects": {}}, {}
         try:
             with open(self.index_path, "rb") as handle:
                 document = json.loads(handle.read().decode("utf-8"))
@@ -80,7 +93,21 @@ class ContentAddressedStore:
             if not isinstance(key, str):
                 raise ObjectStoreError("corrupted index: non-string key")
             objects[key] = self._validate_entry(key, entry)
-        return {"version": INDEX_VERSION, "objects": objects}
+        records = {}
+        raw_records = document.get("uploads", {})
+        if not isinstance(raw_records, dict):
+            raise ObjectStoreError("corrupted index: uploads is not a map")
+        for session_id, record in raw_records.items():
+            if not isinstance(session_id, str) or not isinstance(record, dict):
+                raise ObjectStoreError("corrupted index: bad upload record")
+            key = record.get("key")
+            if not isinstance(key, str):
+                raise ObjectStoreError("corrupted index: bad upload record")
+            records[session_id] = {
+                "key": key,
+                "entry": self._validate_entry(key, record.get("entry")),
+            }
+        return {"version": INDEX_VERSION, "objects": objects}, records
 
     @staticmethod
     def _validate_entry(key, entry):
@@ -97,11 +124,10 @@ class ContentAddressedStore:
         return {"sha256": sha, "size": size, "content_type": content_type}
 
     def _save_index(self):
-        payload = json.dumps(
-            {"version": INDEX_VERSION, "objects": self._index["objects"]},
-            sort_keys=True,
-            separators=(",", ":"),
-        )
+        document = {"version": INDEX_VERSION, "objects": self._index["objects"]}
+        if self._upload_records:
+            document["uploads"] = self._upload_records
+        payload = json.dumps(document, sort_keys=True, separators=(",", ":"))
         _atomic_write(self.index_path, payload.encode("utf-8") + b"\n")
 
     # -- validation ----------------------------------------------------
@@ -225,6 +251,330 @@ class ContentAddressedStore:
         """Return the sorted digests currently present in the blob directory."""
         with self._lock:
             return sorted(name for name in os.listdir(self.blobs_dir) if _is_sha256(name))
+
+    # -- resumable uploads ----------------------------------------------
+    def _session_meta_path(self, session_id):
+        return os.path.join(self.uploads_dir, session_id + ".json")
+
+    def _session_part_path(self, session_id):
+        return os.path.join(self.uploads_dir, session_id + ".part")
+
+    def _load_uploads(self):
+        uploads = {}
+        try:
+            names = os.listdir(self.uploads_dir)
+        except FileNotFoundError:
+            return uploads
+        except OSError:
+            raise ObjectStoreError("upload io error")
+        for name in sorted(names):
+            match = _SESSION_META_RE.match(name)
+            if match is None:
+                continue
+            session_id = match.group(1)
+            if session_id in self._upload_records:
+                # completed before a crash could clean its files up
+                self._discard_session_files(session_id)
+                continue
+            session = self._read_session_meta(session_id)
+            self._check_part_file(session_id, session["offset"])
+            uploads[session_id] = session
+        return uploads
+
+    def _read_session_meta(self, session_id):
+        try:
+            with open(self._session_meta_path(session_id), "rb") as handle:
+                document = json.loads(handle.read().decode("utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError) as exc:
+            raise ObjectStoreError("corrupted upload session: %s" % (exc,))
+        if not isinstance(document, dict):
+            raise ObjectStoreError("corrupted upload session: not an object")
+        key = document.get("key")
+        size = document.get("size")
+        sha = document.get("sha256")
+        content_type = document.get("content_type")
+        offset = document.get("offset")
+        try:
+            self._check_key(key)
+        except ObjectStoreError:
+            raise ObjectStoreError("corrupted upload session: bad key")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise ObjectStoreError("corrupted upload session: bad size")
+        if not _is_sha256(sha):
+            raise ObjectStoreError("corrupted upload session: bad sha256")
+        if content_type is not None and not isinstance(content_type, str):
+            raise ObjectStoreError("corrupted upload session: bad content_type")
+        if isinstance(offset, bool) or not isinstance(offset, int) or not 0 <= offset <= size:
+            raise ObjectStoreError("corrupted upload session: bad offset")
+        return {"key": key, "size": size, "sha256": sha,
+                "content_type": content_type, "offset": offset}
+
+    def _check_part_file(self, session_id, offset):
+        """Ensure the part file holds exactly the confirmed *offset* bytes.
+
+        A crash between the chunk write and the metadata update can leave
+        unconfirmed bytes behind; they are truncated so recovery sees either
+        the old progress or a whole confirmed chunk, never a partial one.
+        """
+        path = self._session_part_path(session_id)
+        try:
+            size_on_disk = os.stat(path).st_size
+        except FileNotFoundError:
+            if offset:
+                raise ObjectStoreError("corrupted upload session: missing data")
+            try:
+                with open(path, "wb"):
+                    pass
+            except OSError:
+                raise ObjectStoreError("upload io error")
+            return
+        except OSError:
+            raise ObjectStoreError("upload io error")
+        if size_on_disk < offset:
+            raise ObjectStoreError("corrupted upload session: truncated data")
+        if size_on_disk > offset:
+            try:
+                with open(path, "r+b") as handle:
+                    handle.truncate(offset)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except OSError:
+                raise ObjectStoreError("upload io error")
+
+    def _save_session(self, session_id, session):
+        payload = json.dumps(session, sort_keys=True, separators=(",", ":"))
+        try:
+            _atomic_write(self._session_meta_path(session_id),
+                          payload.encode("utf-8") + b"\n")
+        except OSError:
+            raise ObjectStoreError("upload io error")
+
+    def _write_part(self, session_id, offset, data):
+        try:
+            with open(self._session_part_path(session_id), "r+b") as handle:
+                handle.seek(offset)
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError:
+            raise ObjectStoreError("upload io error")
+
+    def _read_part(self, session_id, offset, length):
+        try:
+            with open(self._session_part_path(session_id), "rb") as handle:
+                handle.seek(offset)
+                return handle.read(length)
+        except OSError:
+            raise ObjectStoreError("upload io error")
+
+    def _remove_session_files(self, session_id):
+        for path in (self._session_meta_path(session_id),
+                     self._session_part_path(session_id)):
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                raise ObjectStoreError("upload io error")
+        self._tidy_uploads_dir()
+
+    def _discard_session_files(self, session_id):
+        for path in (self._session_meta_path(session_id),
+                     self._session_part_path(session_id)):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        self._tidy_uploads_dir()
+
+    def _tidy_uploads_dir(self):
+        try:
+            os.rmdir(self.uploads_dir)
+        except OSError:
+            pass
+
+    def _new_session_id(self):
+        while True:
+            session_id = uuid.uuid4().hex
+            if session_id in self._uploads or session_id in self._upload_records:
+                continue
+            if os.path.exists(self._session_meta_path(session_id)):
+                continue
+            return session_id
+
+    @staticmethod
+    def _check_session_id(session_id):
+        if not isinstance(session_id, str) or not session_id:
+            raise ObjectStoreError("invalid upload session: %r" % (session_id,))
+        return session_id
+
+    def _require_active_session(self, session_id):
+        self._check_session_id(session_id)
+        if session_id in self._upload_records:
+            raise ObjectStoreError("upload session already completed: %s" % (session_id,))
+        session = self._uploads.get(session_id)
+        if session is None:
+            raise ObjectStoreError("unknown upload session: %r" % (session_id,))
+        return session
+
+    def begin_upload(self, key, size, sha256, content_type=None):
+        """Start a resumable upload session and return its unique id.
+
+        The key and content type follow the same rules as :meth:`put`, *size*
+        must be a non-negative integer (booleans excluded) and *sha256* the
+        64 lowercase hex digits of the full content's digest. Creating a
+        session changes no object; the session and its progress survive
+        reopening the data directory.
+        """
+        self._check_key(key)
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise ObjectStoreError("invalid size: %r" % (size,))
+        self._require_sha(sha256)
+        if content_type is not None and not isinstance(content_type, str):
+            raise ObjectStoreError("content_type must be a string or None")
+        session = {"key": key, "size": size, "sha256": sha256,
+                   "content_type": content_type, "offset": 0}
+        with self._lock:
+            session_id = self._new_session_id()
+            try:
+                os.makedirs(self.uploads_dir, exist_ok=True)
+                with open(self._session_part_path(session_id), "wb"):
+                    pass
+            except OSError:
+                raise ObjectStoreError("upload io error")
+            try:
+                self._save_session(session_id, session)
+            except ObjectStoreError:
+                self._discard_session_files(session_id)
+                raise
+            self._uploads[session_id] = session
+            return session_id
+
+    def upload_status(self, session_id):
+        """Return the declaration, received ``offset`` and ``completed`` flag."""
+        self._check_session_id(session_id)
+        with self._lock:
+            record = self._upload_records.get(session_id)
+            if record is not None:
+                entry = record["entry"]
+                return {"key": record["key"], "size": entry["size"],
+                        "sha256": entry["sha256"],
+                        "content_type": entry["content_type"],
+                        "offset": entry["size"], "completed": True}
+            session = self._uploads.get(session_id)
+            if session is None:
+                raise ObjectStoreError("unknown upload session: %r" % (session_id,))
+            return {"key": session["key"], "size": session["size"],
+                    "sha256": session["sha256"],
+                    "content_type": session["content_type"],
+                    "offset": session["offset"], "completed": False}
+
+    def append_upload(self, session_id, offset, payload):
+        """Append one chunk to *session_id* and return the received length.
+
+        A new chunk must start exactly at the current end and may not exceed
+        the declared total size. A chunk lying fully inside the received
+        range succeeds without growing when its bytes are identical to what
+        is stored, and fails otherwise; chunks overlapping the end, chunks
+        past the end and empty chunks anywhere but at the end all fail.
+        """
+        self._check_session_id(session_id)
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ObjectStoreError("invalid offset: %r" % (offset,))
+        if not isinstance(payload, (bytes, bytearray, memoryview)):
+            raise ObjectStoreError("payload must be bytes")
+        data = bytes(payload)
+        with self._lock:
+            session = self._require_active_session(session_id)
+            current = session["offset"]
+            if offset > current:
+                raise ObjectStoreError(
+                    "append gap: offset %d beyond received %d" % (offset, current))
+            if not data:
+                if offset != current:
+                    raise ObjectStoreError("empty chunk only at received end")
+                return current
+            end = offset + len(data)
+            if offset < current:
+                if end > current:
+                    raise ObjectStoreError("append overlaps received end")
+                if self._read_part(session_id, offset, len(data)) != data:
+                    raise ObjectStoreError("append conflicts with received bytes")
+                return current
+            if end > session["size"]:
+                raise ObjectStoreError("append exceeds declared size")
+            self._write_part(session_id, offset, data)
+            self._save_session(session_id, dict(session, offset=end))
+            session["offset"] = end
+            return end
+
+    def complete_upload(self, session_id):
+        """Publish the object once the received content matches the declaration.
+
+        The total length and the SHA-256 of the full content must match the
+        declared values (zero-byte objects included); only then is the object
+        published and the put-style metadata returned. Repeating a completed
+        call returns the first result without touching the key again, so
+        later writes or deletes of the key are never overwritten.
+        """
+        self._check_session_id(session_id)
+        with self._lock:
+            record = self._upload_records.get(session_id)
+            if record is not None:
+                return dict(record["entry"])
+            session = self._uploads.get(session_id)
+            if session is None:
+                raise ObjectStoreError("unknown upload session: %r" % (session_id,))
+            if session["offset"] != session["size"]:
+                raise ObjectStoreError(
+                    "upload incomplete: %d of %d bytes received"
+                    % (session["offset"], session["size"]))
+            data = self._read_part(session_id, 0, session["size"])
+            if len(data) != session["size"]:
+                raise ObjectStoreError("upload io error")
+            if hashlib.sha256(data).hexdigest() != session["sha256"]:
+                raise ObjectStoreError("upload hash mismatch")
+            entry = {"sha256": session["sha256"], "size": session["size"],
+                     "content_type": session["content_type"]}
+            self._store_blob(session["sha256"], data)
+            previous = self._index["objects"].get(session["key"], _MISSING)
+            self._index["objects"][session["key"]] = entry
+            self._upload_records[session_id] = {
+                "key": session["key"], "entry": dict(entry),
+            }
+            try:
+                self._save_index()
+            except OSError:
+                del self._upload_records[session_id]
+                if previous is _MISSING:
+                    del self._index["objects"][session["key"]]
+                else:
+                    self._index["objects"][session["key"]] = previous
+                raise ObjectStoreError("upload io error")
+            del self._uploads[session_id]
+            self._discard_session_files(session_id)
+            return dict(entry)
+
+    def abort_upload(self, session_id):
+        """Drop *session_id* and return None; published objects are kept."""
+        self._check_session_id(session_id)
+        with self._lock:
+            record = self._upload_records.get(session_id)
+            if record is not None:
+                del self._upload_records[session_id]
+                try:
+                    self._save_index()
+                except OSError:
+                    self._upload_records[session_id] = record
+                    raise ObjectStoreError("upload io error")
+                self._discard_session_files(session_id)
+                return None
+            session = self._uploads.get(session_id)
+            if session is None:
+                raise ObjectStoreError("unknown upload session: %r" % (session_id,))
+            self._remove_session_files(session_id)
+            del self._uploads[session_id]
+            return None
 
     def collect_garbage(self, dry_run=True):
         """Collect unreferenced blobs, previewing by default.

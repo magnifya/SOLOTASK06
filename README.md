@@ -70,6 +70,46 @@ result = store.collect_garbage()              # preview only
 store.collect_garbage(dry_run=False)          # actually delete
 ```
 
+### Resumable uploads
+
+Large or unreliable transfers can be uploaded in chunks through a persistent
+session instead of a single `put`:
+
+```python
+session = store.begin_upload("docs/big.bin", size, sha256_of_full_content,
+                             content_type="application/octet-stream")
+store.upload_status(session)          # {"key","size","sha256","content_type","offset","completed"}
+store.append_upload(session, 0, first_chunk)      # returns the received length
+store.append_upload(session, len(first_chunk), second_chunk)
+entry = store.complete_upload(session)            # publishes, returns put metadata
+store.abort_upload(session)                       # or drop the session entirely
+```
+
+`begin_upload` validates the key and content type exactly like `put`, requires
+a non-negative integer `size` (booleans excluded) and the 64 lowercase hex
+digits of the full content's SHA-256, and returns a unique string session id.
+Creating a session changes no object, and sessions with their confirmed
+progress survive reopening the data directory. `append_upload` accepts the
+same byte types as `put`: a new chunk must start exactly at the current end
+and may not exceed the declared size; re-sending identical bytes fully inside
+the received range succeeds without growing, while different bytes, chunks
+overlapping the received end, gaps and empty chunks anywhere but at the end
+all raise `ObjectStoreError`. `complete_upload` publishes the object only when
+the received length and the SHA-256 of the full content match the declaration
+(zero-byte objects included); until then the key keeps its old value and no
+new blob appears. Appending after completion fails, repeating a completed
+`complete_upload` returns the first result without overwriting later writes
+or deletes of the key, and `abort_upload` removes the session (returning
+`None`) without deleting any published object. An interrupted append leaves
+either the old progress or a whole new chunk, and an interrupted complete
+leaves either the old object or the fully published new one; after recovery
+the `completed` flag always agrees with what was published. Sessions on the
+same key are independent and publish in completion order. Garbage collection
+never touches data needed by incomplete sessions; once a session completes or
+is aborted, its blob follows the normal object-reference rules and the
+completion record itself keeps nothing alive. The HTTP and command line
+interfaces are unchanged by this feature.
+
 `collect_garbage(dry_run=True)` returns
 `{"digests": [...], "bytes": <int>, "dry_run": <bool>}`: the digests sorted
 lexicographically and the sum of the files' actual byte sizes (zero-byte
@@ -141,15 +181,20 @@ Notes:
 
 ```
 <data-dir>/
-  index.json          # {"version":1,"objects":{"<key>":{"sha256","size","content_type"}}}
-  blobs/<sha256>      # raw object bytes, one file per distinct digest
+  index.json            # {"version":1,"objects":{"<key>":{"sha256","size","content_type"}},
+                        #  "uploads":{"<session>":{"key","entry"}}} (only while non-empty)
+  blobs/<sha256>        # raw object bytes, one file per distinct digest
+  uploads/<session>.json  # active upload declaration plus confirmed offset (lazy directory)
+  uploads/<session>.part  # received bytes of an active upload
 ```
 
 ## Limits of this seed
 
-The following long-term goals are intentionally not implemented yet: chunked and
-resumable uploads, object versioning and retention policies, lifecycle policies
-on top of the existing garbage collection of unreferenced blobs, quotas and
-rate limiting, consistent hashing and rebalancing, erasure coding and repair,
-signed URLs and access control, cross-region replication and end-to-end audit
-logging. Authentication is out of scope: the server trusts every caller.
+The following long-term goals are intentionally not implemented yet: object
+versioning and retention policies, lifecycle policies on top of the existing
+garbage collection of unreferenced blobs, quotas and rate limiting, consistent
+hashing and rebalancing, erasure coding and repair, signed URLs and access
+control, cross-region replication and end-to-end audit logging. Resumable
+uploads exist only in the Python API; the HTTP and command line surfaces do
+not expose them yet. Authentication is out of scope: the server trusts every
+caller.
