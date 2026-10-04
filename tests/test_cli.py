@@ -83,5 +83,57 @@ class TestGetIntegrity(CLITestCase):
             self.assertEqual(handle.read(), payload)
 
 
+class TestGarbageCollection(CLITestCase):
+    def seed_orphan(self, key="k", payload=b"old"):
+        source = os.path.join(self.tmp, "src.bin")
+        with open(source, "wb") as handle:
+            handle.write(payload)
+        self.assertEqual(self.run_cli("put", "--key", key, "--file", source).returncode, 0)
+        old_digest = sha(payload)
+        source2 = os.path.join(self.tmp, "src2.bin")
+        with open(source2, "wb") as handle:
+            handle.write(payload + b"-new")
+        self.assertEqual(self.run_cli("put", "--key", key, "--file", source2).returncode, 0)
+        return old_digest, len(payload)
+
+    def test_gc_defaults_to_preview(self):
+        old_digest, size = self.seed_orphan()
+        proc = self.run_cli("gc")
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stderr, b"")
+        self.assertEqual(proc.stdout.count(b"\n"), 1)
+        self.assertEqual(json.loads(proc.stdout.decode("utf-8")),
+                         {"ok": True, "digests": [old_digest], "bytes": size,
+                          "dry_run": True})
+        self.assertTrue(os.path.exists(os.path.join(self.data_dir, "blobs", old_digest)))
+
+    def test_gc_execute_deletes_candidates(self):
+        old_digest, size = self.seed_orphan()
+        proc = self.run_cli("gc", "--execute")
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(json.loads(proc.stdout.decode("utf-8")),
+                         {"ok": True, "digests": [old_digest], "bytes": size,
+                          "dry_run": False})
+        self.assertFalse(os.path.exists(os.path.join(self.data_dir, "blobs", old_digest)))
+
+        proc = self.run_cli("gc")
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(json.loads(proc.stdout.decode("utf-8")),
+                         {"ok": True, "digests": [], "bytes": 0, "dry_run": True})
+
+    def test_gc_keeps_referenced_and_non_blob_files(self):
+        source = os.path.join(self.tmp, "src.bin")
+        with open(source, "wb") as handle:
+            handle.write(b"referenced")
+        self.assertEqual(self.run_cli("put", "--key", "live", "--file", source).returncode, 0)
+        with open(os.path.join(self.data_dir, "blobs", "stray.tmp.1.2"), "wb") as handle:
+            handle.write(b"temp")
+        proc = self.run_cli("gc", "--execute")
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(json.loads(proc.stdout.decode("utf-8"))["digests"], [])
+        self.assertTrue(os.path.exists(os.path.join(self.data_dir, "blobs", sha(b"referenced"))))
+        self.assertTrue(os.path.exists(os.path.join(self.data_dir, "blobs", "stray.tmp.1.2")))
+
+
 if __name__ == "__main__":
     unittest.main()

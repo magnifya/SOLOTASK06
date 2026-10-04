@@ -48,6 +48,8 @@ python3 -m objstore --data-dir ./objstore_data put --key docs/a.txt --file ./a.t
 python3 -m objstore --data-dir ./objstore_data get --key docs/a.txt --out ./copy.txt
 python3 -m objstore --data-dir ./objstore_data list --prefix docs/ --limit 100
 python3 -m objstore --data-dir ./objstore_data delete --key docs/a.txt
+python3 -m objstore --data-dir ./objstore_data gc             # preview only
+python3 -m objstore --data-dir ./objstore_data gc --execute   # actually delete
 ```
 
 The global `--data-dir` option must appear before the subcommand; it defaults to
@@ -64,7 +66,48 @@ store = ContentAddressedStore("./objstore_data")
 entry = store.put("docs/a.txt", b"hello", content_type="text/plain")
 payload, head = store.get("docs/a.txt")
 page = store.list_objects(prefix="docs/", after=None, limit=100)
+store.collect_garbage()              # preview: {"digests": [...], "bytes": n, "dry_run": True}
+store.collect_garbage(dry_run=False) # delete unreferenced blobs for real
 ```
+
+## Garbage collection
+
+Deleting a key removes only its metadata entry; the blob bytes stay on disk.
+`ContentAddressedStore.collect_garbage(dry_run=True)` reclaims that space. It
+recomputes the live set from the current object index on every call, so:
+
+* blobs referenced by any object are always kept, including blobs shared by
+  several keys;
+* the old bytes of an overwritten object, the bytes left after the last
+  reference is deleted, and complete blobs that were never indexed are all
+  collectable;
+* a preview (`dry_run=True`, the default, or `gc` with no flags) reports the
+  candidates without touching any stored file; an execution
+  (`dry_run=False`, or `gc --execute`) returns the digests that were actually
+  removed.
+
+Both forms return `{"digests": [...], "bytes": n, "dry_run": bool}` with
+digests in lexicographic order and `bytes` equal to the sum of the actual
+sizes of the reported files (zero-byte candidates count). An empty result is
+`[]` / `0`.
+
+Only regular files directly under `blobs/` whose names are exactly 64
+lowercase hex digits are eligible. Other names, leftover temporary files,
+subdirectories and symbolic links are preserved, and symlink targets are never
+followed. Content is not verified before removing an unreferenced file, and a
+referenced blob that is missing or corrupted neither blocks the other
+candidates nor changes its metadata; ordinary read errors are reported as
+before. A candidate that disappears while the scan or the deletes are running
+is simply skipped and excluded from the result. Any other directory scan,
+file-stat or delete I/O failure raises `ObjectStoreError("gc io error")`; a
+failed scan removes nothing, while a failure midway through a delete leaves
+the completed deletions in place and a later retry safely reaps the rest.
+`dry_run` must be a boolean or `ObjectStoreError("invalid dry_run")` is raised
+before anything is touched. Garbage collection and object reads and writes on
+the same store instance are serialized by one lock, so content that is being
+published or is still referenced is never deleted; content referenced after a
+preview is retained by a later execution. Cross-process locking is out of
+scope.
 
 ## Tests
 
@@ -108,7 +151,8 @@ Notes:
   page can be passed straight back as `after` to fetch the next page.
 * `limit` must be an integer between 1 and 1000.
 * Deleting a key removes only the metadata entry; blob bytes remain on disk
-  because other keys may still reference the same digest.
+  because other keys may still reference the same digest. Run
+  `collect_garbage` (or the `gc` command) to reclaim unreferenced blobs.
 
 ## Storage layout
 
@@ -121,8 +165,9 @@ Notes:
 ## Limits of this seed
 
 The following long-term goals are intentionally not implemented yet: chunked and
-resumable uploads, object versioning and retention policies, lifecycle and
-garbage collection of unreferenced blobs, quotas and rate limiting, consistent
+resumable uploads, object versioning and retention policies, automatic lifecycle
+expiry (manual garbage collection of unreferenced blobs is available via
+`collect_garbage` / the `gc` command), quotas and rate limiting, consistent
 hashing and rebalancing, erasure coding and repair, signed URLs and access
 control, cross-region replication and end-to-end audit logging. Authentication
 is out of scope: the server trusts every caller.

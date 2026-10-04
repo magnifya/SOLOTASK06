@@ -391,5 +391,269 @@ class TestConcurrency(StoreTestCase):
         self.assertEqual(errors, [])
 
 
+class TestGarbageCollection(StoreTestCase):
+    def orphan(self, data, name=None):
+        """Write an unreferenced blob directly and return its digest name."""
+        name = name if name is not None else sha(data)
+        with open(os.path.join(self.store.blobs_dir, name), "wb") as handle:
+            handle.write(data)
+        return name
+
+    def test_preview_lists_candidates_and_changes_nothing(self):
+        old = self.store.put("k", b"old")["sha256"]
+        self.store.put("k", b"new")
+        result = self.store.collect_garbage()
+        self.assertEqual(result, {"digests": [old], "bytes": 3, "dry_run": True})
+        self.assertEqual(self.store.blob(old), b"old")
+        # the default argument previews too
+        self.assertEqual(self.store.collect_garbage(dry_run=True)["digests"], [old])
+
+    def test_execute_deletes_candidates_and_reports_what_was_removed(self):
+        old = self.store.put("k", b"old-bytes")["sha256"]
+        self.store.put("k", b"new-bytes")
+        result = self.store.collect_garbage(dry_run=False)
+        self.assertEqual(result, {"digests": [old], "bytes": 9, "dry_run": False})
+        self.assertFalse(os.path.exists(os.path.join(self.store.blobs_dir, old)))
+        self.assertEqual(self.store.collect_garbage(dry_run=False),
+                         {"digests": [], "bytes": 0, "dry_run": False})
+
+    def test_shared_content_is_kept_until_the_last_reference_is_gone(self):
+        entry = self.store.put("a", b"shared")
+        self.store.put("b", b"shared")
+        self.store.delete("a")
+        self.assertEqual(self.store.collect_garbage()["digests"], [])
+        self.store.delete("b")
+        self.assertEqual(self.store.collect_garbage()["digests"], [entry["sha256"]])
+
+    def test_unreferenced_complete_blob_is_collectable(self):
+        digest = self.orphan(b"never-indexed")
+        self.assertEqual(self.store.collect_garbage()["digests"], [digest])
+        self.assertEqual(self.store.collect_garbage(dry_run=False)["digests"], [digest])
+        self.assertFalse(os.path.exists(os.path.join(self.store.blobs_dir, digest)))
+
+    def test_empty_result(self):
+        self.assertEqual(self.store.collect_garbage(),
+                         {"digests": [], "bytes": 0, "dry_run": True})
+        self.assertEqual(self.store.collect_garbage(dry_run=False),
+                         {"digests": [], "bytes": 0, "dry_run": False})
+
+    def test_zero_byte_candidate_counts(self):
+        digest = self.orphan(b"", name=sha(b""))
+        result = self.store.collect_garbage()
+        self.assertEqual(result, {"digests": [digest], "bytes": 0, "dry_run": True})
+        self.store.collect_garbage(dry_run=False)
+        self.assertFalse(os.path.exists(os.path.join(self.store.blobs_dir, digest)))
+
+    def test_digests_are_sorted_and_bytes_are_actual_file_sizes(self):
+        first = self.orphan(b"x" * 4)
+        second = self.orphan(b"y" * 7)
+        # bytes come from the files on disk, so a digest mismatch is irrelevant
+        bogus = self.orphan(b"z" * 10, name=sha(b"totally-different"))
+        result = self.store.collect_garbage()
+        self.assertEqual(result["digests"], sorted([first, second, bogus]))
+        self.assertEqual(result["bytes"], 4 + 7 + 10)
+
+    def test_unverified_content_of_unreferenced_file_does_not_block_reaping(self):
+        digest = sha(b"expected")
+        self.orphan(b"actual-bytes-on-disk", name=digest)
+        result = self.store.collect_garbage(dry_run=False)
+        self.assertEqual(result["digests"], [digest])
+        self.assertEqual(result["bytes"], len(b"actual-bytes-on-disk"))
+
+    def test_referenced_corrupt_or_missing_blob_keeps_other_reclaims_going(self):
+        referenced = self.store.put("k", b"referenced")["sha256"]
+        with open(os.path.join(self.store.blobs_dir, referenced), "wb") as handle:
+            handle.write(b"tampered")
+        missing = self.store.put("gone", b"gone-bytes")["sha256"]
+        self.assertNotEqual(missing, referenced)
+        os.remove(os.path.join(self.store.blobs_dir, missing))
+        orphan = self.orphan(b"orphan")
+        result = self.store.collect_garbage(dry_run=False)
+        self.assertEqual(result["digests"], [orphan])
+        # the corrupt-but-referenced file is untouched
+        with open(os.path.join(self.store.blobs_dir, referenced), "rb") as handle:
+            self.assertEqual(handle.read(), b"tampered")
+
+    def test_preview_then_reference_added_then_execute_keeps_content(self):
+        entry = self.store.put("k", b"once-orphaned")
+        self.store.delete("k")
+        self.assertEqual(self.store.collect_garbage()["digests"], [entry["sha256"]])
+        self.store.put("other", b"once-orphaned")
+        self.assertEqual(self.store.collect_garbage(dry_run=False)["digests"], [])
+        self.assertEqual(self.store.get("other")[0], b"once-orphaned")
+
+    def test_scope_is_plain_hex_files_directly_in_blobs(self):
+        keepers = []
+        keepers.append(("README", b"notes"))
+        keepers.append(("z" * 64, b"upper-case-hex-name"))  # uppercase excluded
+        keepers.append(("0" * 63, b"too-short"))
+        keepers.append(("%s.tmp.1.2" % (sha(b"x"),), b"temp"))
+        for name, data in keepers:
+            with open(os.path.join(self.store.blobs_dir, name), "wb") as handle:
+                handle.write(data)
+        os.mkdir(os.path.join(self.store.blobs_dir, "subdir"))
+        target = os.path.join(self.root, "outside-target")
+        with open(target, "wb") as handle:
+            handle.write(b"outside")
+        link_name = "a" * 64
+        os.symlink(target, os.path.join(self.store.blobs_dir, link_name))
+        dangling = os.path.join(self.store.blobs_dir, "b" * 64)
+        os.symlink(os.path.join(self.root, "no-such-target"), dangling)
+
+        self.assertEqual(self.store.collect_garbage(),
+                         {"digests": [], "bytes": 0, "dry_run": True})
+        result = self.store.collect_garbage(dry_run=False)
+        self.assertEqual(result["digests"], [])
+        for name, data in keepers:
+            with open(os.path.join(self.store.blobs_dir, name), "rb") as handle:
+                self.assertEqual(handle.read(), data)
+        self.assertTrue(os.path.isdir(os.path.join(self.store.blobs_dir, "subdir")))
+        self.assertTrue(os.path.islink(os.path.join(self.store.blobs_dir, link_name)))
+        self.assertTrue(os.path.islink(dangling))
+        with open(target, "rb") as handle:
+            self.assertEqual(handle.read(), b"outside")
+
+    def test_invalid_dry_run_is_rejected_without_touching_storage(self):
+        orphan = self.orphan(b"orphan")
+        for bad in [None, 1, 0, "true", "false", 1.0, [], object()]:
+            with self.assertRaisesRegex(ObjectStoreError, r"\Ainvalid dry_run\Z"):
+                self.store.collect_garbage(dry_run=bad)
+        self.assertTrue(os.path.exists(os.path.join(self.store.blobs_dir, orphan)))
+        self.assertEqual(self.store.collect_garbage()["digests"], [orphan])
+
+    def test_execute_does_not_modify_index(self):
+        self.store.put("k", b"keep")
+        old = self.store.put("o", b"old")["sha256"]
+        self.store.delete("o")
+        with open(self.store.index_path, "rb") as handle:
+            before = handle.read()
+        self.store.collect_garbage(dry_run=False)
+        with open(self.store.index_path, "rb") as handle:
+            self.assertEqual(handle.read(), before)
+        self.assertTrue(os.path.exists(os.path.join(self.store.blobs_dir, sha(b"keep"))))
+        self.assertFalse(os.path.exists(os.path.join(self.store.blobs_dir, old)))
+
+    def test_scan_failure_deletes_nothing(self):
+        import objstore.store as store_module
+        names = sorted([self.orphan(b"c0-%d" % i) for i in range(3)])
+        real_listdir = os.listdir
+
+        def boom(path):
+            if path == self.store.blobs_dir:
+                raise OSError("simulated scan failure")
+            return real_listdir(path)
+
+        store_module.os.listdir = boom
+        try:
+            with self.assertRaisesRegex(ObjectStoreError, r"\Agc io error\Z"):
+                self.store.collect_garbage(dry_run=False)
+        finally:
+            store_module.os.listdir = real_listdir
+        for name in names:
+            self.assertTrue(os.path.exists(os.path.join(self.store.blobs_dir, name)))
+
+    def test_stat_failure_other_than_vanished_is_io_error(self):
+        import objstore.store as store_module
+        self.orphan(b"orphan")
+        real_stat = os.stat
+
+        def boom(path, follow_symlinks=True):
+            raise PermissionError("nope")
+
+        store_module.os.stat = boom
+        try:
+            with self.assertRaisesRegex(ObjectStoreError, r"\Agc io error\Z"):
+                self.store.collect_garbage()
+        finally:
+            store_module.os.stat = real_stat
+
+    def test_candidate_vanished_during_scan_or_delete_is_skipped(self):
+        import objstore.store as store_module
+        survivor = self.orphan(b"survivor")
+        victim = self.orphan(b"vanish-me")
+        real_stat = os.stat
+
+        def stat_skip(path, follow_symlinks=True):
+            if os.path.basename(path) == victim:
+                raise FileNotFoundError("vanished during scan")
+            return real_stat(path, follow_symlinks=follow_symlinks)
+
+        store_module.os.stat = stat_skip
+        try:
+            result = self.store.collect_garbage()
+        finally:
+            store_module.os.stat = real_stat
+        self.assertEqual(result["digests"], [survivor])
+        self.assertEqual(result["bytes"], len(b"survivor"))
+
+        real_remove = os.remove
+
+        def remove_skip(path):
+            if os.path.basename(path) == victim:
+                raise FileNotFoundError("vanished during delete")
+            return real_remove(path)
+
+        store_module.os.remove = remove_skip
+        try:
+            result = self.store.collect_garbage(dry_run=False)
+        finally:
+            store_module.os.remove = real_remove
+        self.assertEqual(result["digests"], [survivor])
+        self.assertEqual(result["bytes"], len(b"survivor"))
+
+    def test_midway_delete_failure_keeps_completed_reaps_and_retry_finishes(self):
+        import objstore.store as store_module
+        names = sorted([self.orphan(b"c0-%d" % i) for i in range(4)])
+        blocker = names[2]
+        real_remove = os.remove
+
+        def flaky(path):
+            if os.path.basename(path) == blocker:
+                raise OSError("simulated delete failure")
+            return real_remove(path)
+
+        store_module.os.remove = flaky
+        try:
+            with self.assertRaisesRegex(ObjectStoreError, r"\Agc io error\Z"):
+                self.store.collect_garbage(dry_run=False)
+        finally:
+            store_module.os.remove = real_remove
+        for name in names[:2]:
+            self.assertFalse(os.path.exists(os.path.join(self.store.blobs_dir, name)))
+        for name in names[2:]:
+            self.assertTrue(os.path.exists(os.path.join(self.store.blobs_dir, name)))
+        # retrying in this or a fresh instance reaps the rest safely
+        result = self.store.collect_garbage(dry_run=False)
+        self.assertEqual(result["digests"], names[2:])
+        for name in names[2:]:
+            self.assertFalse(os.path.exists(os.path.join(self.store.blobs_dir, name)))
+        self.assertEqual(ContentAddressedStore(self.root).collect_garbage(dry_run=False)["digests"], [])
+
+    def test_concurrent_gc_and_puts_keep_live_content(self):
+        self.store.put("seed", b"seed")
+        stop, errors = threading.Event(), []
+
+        def worker():
+            try:
+                while not stop.is_set():
+                    self.store.collect_garbage(dry_run=False)
+            except Exception as exc:  # pragma: no cover - failure path
+                errors.append(exc)
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        try:
+            for index in range(40):
+                self.store.put("k%02d" % index, b"v%02d" % index)
+                self.assertEqual(self.store.get("k%02d" % index)[0], b"v%02d" % index)
+        finally:
+            stop.set()
+            thread.join(timeout=30)
+        self.assertEqual(errors, [])
+        for index in range(40):
+            self.assertEqual(self.store.get("k%02d" % index)[0], b"v%02d" % index)
+        self.assertEqual(self.store.collect_garbage()["digests"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import threading
 
 __all__ = ["ContentAddressedStore", "ObjectStoreError"]
@@ -224,6 +225,62 @@ class ContentAddressedStore:
         """Return the sorted digests currently present in the blob directory."""
         with self._lock:
             return sorted(name for name in os.listdir(self.blobs_dir) if _is_sha256(name))
+
+    def collect_garbage(self, dry_run=True):
+        """Reap regular blob files that no indexed object references.
+
+        Returns ``{"digests": [...], "bytes": n, "dry_run": bool}`` with
+        digests sorted lexicographically. A preview (the default) lists the
+        candidates and changes nothing; an execution returns the digests that
+        were actually removed. Only plain files directly under the blobs
+        directory whose names are 64 lowercase hex digits are considered, so
+        temp files, subdirectories and symlinks (whose targets are never
+        followed) are left alone. Referenced content, including content shared
+        by several keys, is always retained.
+        """
+        if not isinstance(dry_run, bool):
+            raise ObjectStoreError("invalid dry_run")
+        with self._lock:
+            referenced = {entry["sha256"] for entry in self._index["objects"].values()}
+            try:
+                names = os.listdir(self.blobs_dir)
+            except OSError:
+                raise ObjectStoreError("gc io error")
+            candidates = []
+            for name in names:
+                if not _is_sha256(name) or name in referenced:
+                    continue
+                path = os.path.join(self.blobs_dir, name)
+                try:
+                    # follow_symlinks=False never touches a symlink target and
+                    # reports vanished entries as FileNotFoundError below.
+                    st = os.stat(path, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    raise ObjectStoreError("gc io error")
+                if not stat.S_ISREG(st.st_mode):
+                    continue
+                candidates.append((name, st.st_size))
+            candidates.sort(key=lambda item: item[0])
+            if dry_run:
+                return {"digests": [name for name, _ in candidates],
+                        "bytes": sum(size for _, size in candidates),
+                        "dry_run": True}
+            removed = []
+            freed = 0
+            for name, size in candidates:
+                path = os.path.join(self.blobs_dir, name)
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    # Vanished between the scan and the delete: skip it.
+                    continue
+                except OSError:
+                    raise ObjectStoreError("gc io error")
+                removed.append(name)
+                freed += size
+            return {"digests": removed, "bytes": freed, "dry_run": False}
 
     def list_objects(self, prefix="", after=None, limit=DEFAULT_LIMIT):
         """Return ``{"items": [...], "next_after": <str|null>}`` for one page."""

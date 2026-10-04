@@ -1,6 +1,6 @@
 """Command line interface.
 
-``python3 -m objstore --data-dir DIR <serve|put|get|list|delete>``. Each command
+``python3 -m objstore --data-dir DIR <serve|put|get|list|delete|gc>``. Each command
 prints one line of JSON on stdout and exits 0 on success, or one line of JSON on
 stderr and exits non-zero on failure.
 """
@@ -57,6 +57,10 @@ def build_parser():
 
     delete = sub.add_parser("delete", help="delete a key")
     delete.add_argument("--key", required=True)
+
+    gc = sub.add_parser("gc", help="collect unreferenced blobs (preview unless --execute)")
+    gc.add_argument("--execute", action="store_true",
+                    help="actually delete the candidate blobs (default is a preview)")
     return parser
 
 
@@ -127,8 +131,15 @@ def _cmd_delete(args, store):
     return 0
 
 
+def _cmd_gc(args, store):
+    result = store.collect_garbage(dry_run=not args.execute)
+    _emit({"ok": True, "digests": result["digests"], "bytes": result["bytes"],
+           "dry_run": result["dry_run"]})
+    return 0
+
+
 _HANDLERS = {"serve": _cmd_serve, "put": _cmd_put, "get": _cmd_get,
-             "list": _cmd_list, "delete": _cmd_delete}
+             "list": _cmd_list, "delete": _cmd_delete, "gc": _cmd_gc}
 
 
 def main(argv=None):
