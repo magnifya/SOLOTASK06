@@ -1,8 +1,16 @@
 """Standard-library HTTP front end for :class:`ContentAddressedStore`.
 
 Every failure is a single-line JSON body ``{"error": "..."}`` with status 400,
-404, 405, 409, 411 or 500 (500 for a corrupted blob or a blob/upload I/O
+404, 405, 409, 411, 412 or 500 (500 for a corrupted blob or a blob/upload I/O
 error).
+
+Object ``PUT``/``DELETE`` and ``POST /v1/uploads`` accept conditional-write
+headers: ``If-Match: "<sha256>"`` (exactly one double-quoted lowercase digest)
+requires the key to exist with that digest, ``If-None-Match: *`` requires it
+to be absent. Both headers together, a repeated header or a malformed value
+is ``400 {"error":"invalid precondition"}``; a failed precondition is
+``412 {"error":"precondition failed"}``. Object ``GET`` and ``HEAD`` responses
+carry an ``ETag`` header with the current digest in double quotes.
 """
 
 from __future__ import annotations
@@ -23,6 +31,7 @@ from .store import (
 __all__ = ["ObjectStoreHandler", "ObjectStoreHTTPServer", "create_server"]
 
 _SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+_IF_MATCH_RE = re.compile(r'\A"([0-9a-f]{64})"\Z')
 _OBJECTS_PATH = "/v1/objects"
 _BLOBS_PATH = "/v1/blobs"
 _UPLOADS_PATH = "/v1/uploads"
@@ -31,9 +40,10 @@ _DECIMAL_RE = re.compile(r"\A[0-9]+\Z")
 _BAD_REQUEST_PREFIXES = (
     "invalid sha256", "invalid limit", "invalid key", "invalid prefix",
     "invalid after", "invalid size", "invalid offset", "invalid json",
-    "payload", "content_type",
+    "invalid precondition", "payload", "content_type",
 )
 _INTERNAL_ERRORS = ("corrupted blob", "blob io error", "upload io error")
+_NO_PRECONDITION = object()  # no If-Match / If-None-Match header was sent
 
 
 def _json_bytes(payload):
@@ -43,6 +53,8 @@ def _json_bytes(payload):
 def _status_for(message):
     if message in _INTERNAL_ERRORS:
         return 500
+    if message == "precondition failed":
+        return 412
     for prefix in _BAD_REQUEST_PREFIXES:
         if message.startswith(prefix):
             return 400
@@ -86,6 +98,38 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
         if length < 0:
             return None
         return self.rfile.read(length) if length else b""
+
+    def _precondition_headers(self):
+        """Map the conditional-write headers to an ``expected_sha256`` value.
+
+        Returns ``_NO_PRECONDITION`` when neither header is present, ``None``
+        for ``If-None-Match: *`` (the key must not exist) and the digest
+        string for ``If-Match: "<sha256>"`` (the key must exist with that
+        digest). Both headers together, a repeated header or any other value
+        raises ``ObjectStoreError("invalid precondition")``.
+        """
+        if_match = self.headers.get_all("If-Match")
+        if_none_match = self.headers.get_all("If-None-Match")
+        if if_match and if_none_match:
+            raise ObjectStoreError("invalid precondition")
+        if if_match:
+            if len(if_match) != 1:
+                raise ObjectStoreError("invalid precondition")
+            match = _IF_MATCH_RE.match(if_match[0])
+            if match is None:
+                raise ObjectStoreError("invalid precondition")
+            return match.group(1)
+        if if_none_match:
+            if len(if_none_match) != 1 or if_none_match[0] != "*":
+                raise ObjectStoreError("invalid precondition")
+            return None
+        return _NO_PRECONDITION
+
+    @staticmethod
+    def _precondition_kwargs(precondition):
+        if precondition is _NO_PRECONDITION:
+            return {}
+        return {"expected_sha256": precondition}
 
     def do_GET(self):
         self._dispatch("GET")
@@ -143,6 +187,7 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
             return self._error(400, "invalid key")
         store = self.server.store
         if method == "PUT":
+            precondition = self._precondition_headers()
             body = self._read_body()
             if body is None:
                 return self._error(411, "length required")
@@ -150,21 +195,25 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
                 existing = store.head(key)
             except ObjectStoreError:
                 existing = None
-            entry = store.put(key, body, content_type=self.headers.get("Content-Type"))
+            entry = store.put(key, body, content_type=self.headers.get("Content-Type"),
+                              **self._precondition_kwargs(precondition))
             repeated = existing is not None and existing["sha256"] == entry["sha256"]
             body_out = {"key": key, "sha256": entry["sha256"], "size": entry["size"]}
             return self._send(200 if repeated else 201, _json_bytes(body_out))
         if method == "GET":
             data, entry = store.get(key)
+            etag = '"%s"' % entry["sha256"]
             return self._send(200, data, entry["content_type"] or _DEFAULT_CONTENT_TYPE,
-                              [("X-Content-Sha256", entry["sha256"])])
+                              [("X-Content-Sha256", entry["sha256"]), ("ETag", etag)])
         if method == "HEAD":
             entry = store.head(key)
+            etag = '"%s"' % entry["sha256"]
             return self._send(200, b"", entry["content_type"] or _DEFAULT_CONTENT_TYPE,
-                              [("X-Content-Sha256", entry["sha256"])], head_only=True,
-                              length=entry["size"])
+                              [("X-Content-Sha256", entry["sha256"]), ("ETag", etag)],
+                              head_only=True, length=entry["size"])
         if method == "DELETE":
-            store.delete(key)
+            precondition = self._precondition_headers()
+            store.delete(key, **self._precondition_kwargs(precondition))
             return self._send(204, b"")
         return self._error(405, "method not allowed")
 
@@ -216,6 +265,7 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
         return int(values[0])
 
     def _create_upload(self):
+        precondition = self._precondition_headers()
         body, error = self._read_length_body()
         if error is not None:
             return self._error(*error)
@@ -230,7 +280,8 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
         content_type = document.get("content_type")
         session_id = self.server.store.begin_upload(
             document["key"], document["size"], document["sha256"],
-            content_type=content_type)
+            content_type=content_type,
+            **self._precondition_kwargs(precondition))
         return self._send(201, _json_bytes({"session": session_id}))
 
     def _upload_session(self, method, tail, query):

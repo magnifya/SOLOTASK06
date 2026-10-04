@@ -11,6 +11,15 @@ session is a ``<session>.json`` declaration plus confirmed offset and a
 publishes the object and records the result in the index's ``uploads`` map in
 one atomic index rewrite, so the completion flag can never disagree with the
 published object.
+
+Conditional writes: ``put``, ``delete`` and ``begin_upload`` accept an
+optional ``expected_sha256`` precondition — ``None`` requires the key to be
+absent, a 64-digit lowercase hex digest requires the key to be present with
+exactly that digest in its metadata. The check and the mutation it guards
+happen under the same lock, so two concurrent writers relying on the same old
+digest cannot both succeed. Upload sessions persist the precondition in their
+declaration and evaluate it against the object state at publish time, after
+the length and hash of the received content have been verified.
 """
 
 from __future__ import annotations
@@ -35,6 +44,7 @@ MAX_LIMIT = 1000
 _SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 _SESSION_META_RE = re.compile(r"\A([0-9a-f]{32})\.json\Z")
 _MISSING = object()
+_UNSET = object()  # default for expected_sha256: no precondition given
 
 
 class ObjectStoreError(Exception):
@@ -162,18 +172,55 @@ class ContentAddressedStore:
             raise ObjectStoreError("invalid sha256: %r" % (sha256,))
         return sha256
 
+    @staticmethod
+    def _check_precondition(expected_sha256):
+        """Validate an ``expected_sha256`` argument.
+
+        Returns the value unchanged: ``_UNSET`` (no precondition), ``None``
+        (the key must not exist) or a digest string (the key must exist with
+        exactly that digest). Anything else is rejected.
+        """
+        if expected_sha256 is _UNSET or expected_sha256 is None:
+            return expected_sha256
+        if _is_sha256(expected_sha256):
+            return expected_sha256
+        raise ObjectStoreError("invalid precondition")
+
+    def _precondition_met(self, key, expected_sha256):
+        """Whether the precondition holds for *key*'s current metadata.
+
+        Only the digest recorded for this one key is compared; the content
+        type and every other key are irrelevant.
+        """
+        entry = self._index["objects"].get(key)
+        if expected_sha256 is None:
+            return entry is None
+        return entry is not None and entry["sha256"] == expected_sha256
+
     # -- object API ----------------------------------------------------
-    def put(self, key, payload, content_type=None):
-        """Store *payload* under *key* and return its metadata entry."""
+    def put(self, key, payload, content_type=None, expected_sha256=_UNSET):
+        """Store *payload* under *key* and return its metadata entry.
+
+        When *expected_sha256* is given, the write happens only if the
+        precondition holds for the key's current state: ``None`` requires the
+        key to be absent, a digest requires the key to be present with that
+        digest. A failed precondition raises
+        ``ObjectStoreError("precondition failed")`` and changes no object,
+        session or blob; the check and the write are one locked operation.
+        """
         self._check_key(key)
         if not isinstance(payload, (bytes, bytearray, memoryview)):
             raise ObjectStoreError("payload must be bytes")
         if content_type is not None and not isinstance(content_type, str):
             raise ObjectStoreError("content_type must be a string or None")
+        expected_sha256 = self._check_precondition(expected_sha256)
         data = bytes(payload)
         sha = hashlib.sha256(data).hexdigest()
         entry = {"sha256": sha, "size": len(data), "content_type": content_type}
         with self._lock:
+            if (expected_sha256 is not _UNSET
+                    and not self._precondition_met(key, expected_sha256)):
+                raise ObjectStoreError("precondition failed")
             self._store_blob(sha, data)
             self._index["objects"][key] = entry
             self._save_index()
@@ -227,10 +274,22 @@ class ContentAddressedStore:
                 raise ObjectStoreError("not found: %s" % (key,))
             return dict(entry)
 
-    def delete(self, key):
-        """Drop *key*; shared blobs stay on disk for the keys still using them."""
+    def delete(self, key, expected_sha256=_UNSET):
+        """Drop *key*; shared blobs stay on disk for the keys still using them.
+
+        When *expected_sha256* is given, the deletion happens only if the
+        precondition holds (``None``: the key must be absent, a digest: the
+        key must be present with that digest); otherwise
+        ``ObjectStoreError("precondition failed")`` is raised and nothing
+        changes. A satisfied "must be absent" precondition still reports the
+        missing key with the usual not-found error.
+        """
         self._check_key(key)
+        expected_sha256 = self._check_precondition(expected_sha256)
         with self._lock:
+            if (expected_sha256 is not _UNSET
+                    and not self._precondition_met(key, expected_sha256)):
+                raise ObjectStoreError("precondition failed")
             if key not in self._index["objects"]:
                 raise ObjectStoreError("not found: %s" % (key,))
             del self._index["objects"][key]
@@ -315,8 +374,15 @@ class ContentAddressedStore:
             raise ObjectStoreError("corrupted upload session: bad content_type")
         if isinstance(offset, bool) or not isinstance(offset, int) or not 0 <= offset <= size:
             raise ObjectStoreError("corrupted upload session: bad offset")
-        return {"key": key, "size": size, "sha256": sha,
-                "content_type": content_type, "offset": offset}
+        session = {"key": key, "size": size, "sha256": sha,
+                   "content_type": content_type, "offset": offset}
+        if "expected_sha256" in document:
+            expected = document["expected_sha256"]
+            if expected is not None and not _is_sha256(expected):
+                raise ObjectStoreError(
+                    "corrupted upload session: bad expected_sha256")
+            session["expected_sha256"] = expected
+        return session
 
     def _check_part_file(self, session_id, offset):
         """Ensure the part file holds exactly the confirmed *offset* bytes.
@@ -427,7 +493,8 @@ class ContentAddressedStore:
             raise ObjectStoreError("unknown upload session: %r" % (session_id,))
         return session
 
-    def begin_upload(self, key, size, sha256, content_type=None):
+    def begin_upload(self, key, size, sha256, content_type=None,
+                     expected_sha256=_UNSET):
         """Start a resumable upload session and return its unique id.
 
         The key and content type follow the same rules as :meth:`put`, *size*
@@ -435,6 +502,10 @@ class ContentAddressedStore:
         64 lowercase hex digits of the full content's digest. Creating a
         session changes no object; the session and its progress survive
         reopening the data directory.
+
+        An *expected_sha256* precondition (same meaning as in :meth:`put`) is
+        stored with the declaration and evaluated only when the completed
+        upload is published; it is never checked at creation or append time.
         """
         self._check_key(key)
         if isinstance(size, bool) or not isinstance(size, int) or size < 0:
@@ -442,8 +513,11 @@ class ContentAddressedStore:
         self._require_sha(sha256)
         if content_type is not None and not isinstance(content_type, str):
             raise ObjectStoreError("content_type must be a string or None")
+        expected_sha256 = self._check_precondition(expected_sha256)
         session = {"key": key, "size": size, "sha256": sha256,
                    "content_type": content_type, "offset": 0}
+        if expected_sha256 is not _UNSET:
+            session["expected_sha256"] = expected_sha256
         with self._lock:
             session_id = self._new_session_id()
             try:
@@ -526,6 +600,12 @@ class ContentAddressedStore:
         published and the put-style metadata returned. Repeating a completed
         call returns the first result without touching the key again, so
         later writes or deletes of the key are never overwritten.
+
+        A session created with a precondition evaluates it against the
+        object state at publish time, after the length and hash checks; a
+        failed precondition raises ``ObjectStoreError("precondition
+        failed")`` and leaves the confirmed bytes and the incomplete state
+        untouched, so the session can be completed again or aborted.
         """
         self._check_session_id(session_id)
         with self._lock:
@@ -544,6 +624,10 @@ class ContentAddressedStore:
                 raise ObjectStoreError("upload io error")
             if hashlib.sha256(data).hexdigest() != session["sha256"]:
                 raise SessionConflict("upload hash mismatch")
+            expected = session.get("expected_sha256", _UNSET)
+            if (expected is not _UNSET
+                    and not self._precondition_met(session["key"], expected)):
+                raise ObjectStoreError("precondition failed")
             entry = {"sha256": session["sha256"], "size": session["size"],
                      "content_type": session["content_type"]}
             self._store_blob(session["sha256"], data)

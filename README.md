@@ -85,6 +85,28 @@ result = store.collect_garbage()              # preview only
 store.collect_garbage(dry_run=False)          # actually delete
 ```
 
+### Conditional writes
+
+`put`, `delete` and `begin_upload` accept an optional `expected_sha256`
+keyword that turns the call into a compare-and-swap on the key's current
+digest. Omitting it keeps the unconditional behaviour; passing `None`
+requires the key to be absent; passing the 64 lowercase hex digits of a
+digest requires the key to exist with exactly that digest in its metadata.
+Any other value raises `ObjectStoreError("invalid precondition")`. Only the
+digest of that one key is compared — the content type and other keys play no
+role. A failed condition raises `ObjectStoreError("precondition failed")`
+and changes no object, upload session or blob; a `delete` whose "must be
+absent" condition is satisfied still reports the missing key with the usual
+not-found error. The check and the write or delete it guards are a single
+locked operation, so of two concurrent writers relying on the same old
+digest only one can succeed.
+
+```python
+store.put("docs/a.txt", b"v2", expected_sha256=sha256_of_v1)  # update if unchanged
+store.put("docs/b.txt", b"new", expected_sha256=None)         # create only if absent
+store.delete("docs/a.txt", expected_sha256=sha256_of_v2)      # delete if unchanged
+```
+
 ### Resumable uploads
 
 Large or unreliable transfers can be uploaded in chunks through a persistent
@@ -103,8 +125,11 @@ store.abort_upload(session)                       # or drop the session entirely
 `begin_upload` validates the key and content type exactly like `put`, requires
 a non-negative integer `size` (booleans excluded) and the 64 lowercase hex
 digits of the full content's SHA-256, and returns a unique string session id.
-Creating a session changes no object, and sessions with their confirmed
-progress survive reopening the data directory. `append_upload` accepts the
+An optional `expected_sha256` precondition (same meaning as in `put`) is
+stored with the declaration and survives reopening the data directory; it is
+never checked at creation or append time, only when the completed upload is
+published. Creating a session changes no object, and sessions with their
+confirmed progress survive reopening the data directory. `append_upload` accepts the
 same byte types as `put`: a new chunk must start exactly at the current end
 and may not exceed the declared size; re-sending identical bytes fully inside
 the received range succeeds without growing, while different bytes, chunks
@@ -112,7 +137,10 @@ overlapping the received end, gaps and empty chunks anywhere but at the end
 all raise `ObjectStoreError`. `complete_upload` publishes the object only when
 the received length and the SHA-256 of the full content match the declaration
 (zero-byte objects included); until then the key keeps its old value and no
-new blob appears. Appending after completion fails, repeating a completed
+new blob appears. A session declared with a precondition then evaluates it
+against the object state at publish time: a failed condition raises
+`ObjectStoreError("precondition failed")` and keeps the confirmed bytes and
+the incomplete state, so the session can be completed again or aborted. Appending after completion fails, repeating a completed
 `complete_upload` returns the first result without overwriting later writes
 or deletes of the key, and `abort_upload` removes the session (returning
 `None`) without deleting any published object. An interrupted append leaves
@@ -159,7 +187,16 @@ Errors are always JSON: `{"error": "..."}`. Unknown keys return
 `404 {"error":"not found"}`; a malformed digest returns
 `400 {"error":"invalid sha256"}`; an out-of-range or non-numeric `limit`
 returns `400 {"error":"invalid limit"}`; an unknown path returns
-`404 {"error":"not found"}`. Upload session conflicts (gaps, bytes past the
+`404 {"error":"not found"}`. Conditional-write headers on object `PUT`,
+object `DELETE` and `POST /v1/uploads` follow strict formats: `If-Match`
+accepts exactly one double-quoted lowercase digest (`"<sha256>"`) and
+requires the key to exist with that digest, `If-None-Match` accepts only `*`
+and requires the key to be absent. Both headers together, a repeated header
+or a malformed value returns `400 {"error":"invalid precondition"}`, and a
+condition that does not hold returns `412 {"error":"precondition failed"}`
+without changing any object, session or blob. Object `GET` and `HEAD`
+responses carry an `ETag` header with the current digest in double quotes;
+other successful responses are unchanged. Upload session conflicts (gaps, bytes past the
 received end or the declared size, conflicting re-sends, empty chunks away
 from the end, appending after completion, or completing with the wrong length
 or hash) return `409` and never change progress or the target object; a
@@ -180,16 +217,16 @@ checks.
 | Method | Path | Success | Error codes |
 | --- | --- | --- | --- |
 | GET | `/healthz` | 200 `{"ok": true}` | 405 |
-| PUT | `/v1/objects/{key}` | 201 `{"key","sha256","size"}` on first store; 200 with the same body when the same bytes are stored again | 400 invalid key, 411 missing Content-Length, 405, 500 blob io error |
-| GET | `/v1/objects/{key}` | 200 raw bytes, headers `Content-Type` and `X-Content-Sha256` | 404 unknown key, 400 invalid key, 405, 500 corrupted blob / blob io error |
-| HEAD | `/v1/objects/{key}` | 200 no body, headers `Content-Length` and `X-Content-Sha256` | 404 unknown key, 400 invalid key, 405 |
-| DELETE | `/v1/objects/{key}` | 204 no body | 404 unknown key, 400 invalid key, 405 |
+| PUT | `/v1/objects/{key}` | 201 `{"key","sha256","size"}` on first store; 200 with the same body when the same bytes are stored again | 400 invalid key or invalid precondition, 411 missing Content-Length, 412 precondition failed, 405, 500 blob io error |
+| GET | `/v1/objects/{key}` | 200 raw bytes, headers `Content-Type`, `X-Content-Sha256` and `ETag` | 404 unknown key, 400 invalid key, 405, 500 corrupted blob / blob io error |
+| HEAD | `/v1/objects/{key}` | 200 no body, headers `Content-Length`, `X-Content-Sha256` and `ETag` | 404 unknown key, 400 invalid key, 405 |
+| DELETE | `/v1/objects/{key}` | 204 no body | 404 unknown key, 400 invalid key or invalid precondition, 412 precondition failed, 405 |
 | GET | `/v1/objects?prefix=&after=&limit=` | 200 `{"items":[{"key","sha256","size","content_type"}],"next_after":<str or null>}` | 400 invalid limit, 400 invalid prefix, 400 invalid after, 405 |
 | GET | `/v1/blobs/{sha256}` | 200 raw bytes of that content, header `X-Content-Sha256` | 400 invalid sha256, 404 unknown digest, 405, 500 corrupted blob / blob io error |
-| POST | `/v1/uploads` | 201 `{"session":"<id>"}`; body is a UTF-8 JSON object with required `key`, `size`, `sha256` and optional `content_type` (default `null`) | 400 invalid json / fields, 411 missing/non-integer/negative Content-Length, 400 Transfer-Encoding / truncated body, 405, 500 upload io error |
+| POST | `/v1/uploads` | 201 `{"session":"<id>"}`; body is a UTF-8 JSON object with required `key`, `size`, `sha256` and optional `content_type` (default `null`); accepts the conditional-write headers | 400 invalid json / fields or invalid precondition, 411 missing/non-integer/negative Content-Length, 400 Transfer-Encoding / truncated body, 405, 500 upload io error |
 | GET | `/v1/uploads/{session}` | 200 `{"key","size","sha256","content_type","offset","completed"}` | 404 unknown or aborted session, 405 |
 | PUT | `/v1/uploads/{session}?offset=<n>` | 200 `{"offset":<confirmed length>}`; body holds the raw chunk bytes and `offset` must be a unique non-negative decimal integer | 400 invalid/truncated framing, 404 unknown or aborted session, 409 gap/overlap/overflow/conflict/empty-chunk/completed, 411 missing/non-integer/negative Content-Length, 405, 500 upload io error |
-| POST | `/v1/uploads/{session}/complete` | 200 `{"sha256","size","content_type"}` (the first result on repeat completion); no body required | 404 unknown or aborted session, 409 incomplete or hash mismatch, 400 bad framing, 405, 500 blob/upload io error |
+| POST | `/v1/uploads/{session}/complete` | 200 `{"sha256","size","content_type"}` (the first result on repeat completion); no body required | 404 unknown or aborted session, 409 incomplete or hash mismatch, 412 precondition failed, 400 bad framing, 405, 500 blob/upload io error |
 | DELETE | `/v1/uploads/{session}` | 204 no body; aborts the session and keeps any published object | 404 unknown or aborted session, 405 |
 
 Notes:
@@ -211,7 +248,11 @@ Upload session notes:
   non-empty slash-separated name without `.`/`..` parts or NUL bytes, `size`
   a non-negative JSON integer (booleans rejected), `sha256` 64 lowercase hex
   digits, and `content_type` a string when present. Extra fields are rejected.
-  Creating a session never creates or changes an object.
+  Creating a session never creates or changes an object. An `If-Match` or
+  `If-None-Match: *` header is stored with the session and evaluated only
+  when the upload is completed, against the object state at publish time; a
+  failed condition returns 412 and keeps the session's confirmed progress,
+  so it can be completed again or aborted.
 * `PUT` appends follow the same rules as `append_upload`: a chunk must start
   at the current received end and may not run past the declared size; a chunk
   fully inside the received range succeeds at 200 without growing progress
@@ -238,7 +279,8 @@ Upload session notes:
   index.json            # {"version":1,"objects":{"<key>":{"sha256","size","content_type"}},
                         #  "uploads":{"<session>":{"key","entry"}}} (only while non-empty)
   blobs/<sha256>        # raw object bytes, one file per distinct digest
-  uploads/<session>.json  # active upload declaration plus confirmed offset (lazy directory)
+  uploads/<session>.json  # active upload declaration plus confirmed offset (lazy directory);
+                          #  carries "expected_sha256" when the session was created with a precondition
   uploads/<session>.part  # received bytes of an active upload
 ```
 
