@@ -1,7 +1,7 @@
 """Standard-library HTTP front end for :class:`ContentAddressedStore`.
 
 Every failure is a single-line JSON body ``{"error": "..."}`` with status 400,
-404, 405 or 411.
+404, 405, 411 or 500 (500 for a corrupted blob or a blob I/O error).
 """
 
 from __future__ import annotations
@@ -31,6 +31,8 @@ def _json_bytes(payload):
 
 
 def _status_for(message):
+    if message == "corrupted blob" or message == "blob io error":
+        return 500
     for prefix in _BAD_REQUEST_PREFIXES:
         if message.startswith(prefix):
             return 400

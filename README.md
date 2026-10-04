@@ -80,17 +80,25 @@ Errors are always JSON: `{"error": "..."}`. Unknown keys return
 `404 {"error":"not found"}`; a malformed digest returns
 `400 {"error":"invalid sha256"}`; an out-of-range or non-numeric `limit`
 returns `400 {"error":"invalid limit"}`; an unknown path returns
-`404 {"error":"not found"}`.
+`404 {"error":"not found"}`. Every object GET and blob GET recomputes the
+SHA-256 of the bytes actually on disk before serving them; object GET also
+checks the byte count against the metadata `size`. A failed check returns
+`500 {"error":"corrupted blob"}` with no object bytes, and an I/O error on an
+existing blob returns `500 {"error":"blob io error"}`. Re-PUTting an object
+whose digest file is corrupted restores that file atomically from the complete
+request body, which also repairs every other key sharing that digest; HEAD,
+listings and digest listings remain metadata-only and perform no content
+checks.
 
 | Method | Path | Success | Error codes |
 | --- | --- | --- | --- |
 | GET | `/healthz` | 200 `{"ok": true}` | 405 |
-| PUT | `/v1/objects/{key}` | 201 `{"key","sha256","size"}` on first store; 200 with the same body when the same bytes are stored again | 400 invalid key, 411 missing Content-Length, 405 |
-| GET | `/v1/objects/{key}` | 200 raw bytes, headers `Content-Type` and `X-Content-Sha256` | 404 unknown key, 400 invalid key, 405 |
+| PUT | `/v1/objects/{key}` | 201 `{"key","sha256","size"}` on first store; 200 with the same body when the same bytes are stored again | 400 invalid key, 411 missing Content-Length, 405, 500 blob io error |
+| GET | `/v1/objects/{key}` | 200 raw bytes, headers `Content-Type` and `X-Content-Sha256` | 404 unknown key, 400 invalid key, 405, 500 corrupted blob / blob io error |
 | HEAD | `/v1/objects/{key}` | 200 no body, headers `Content-Length` and `X-Content-Sha256` | 404 unknown key, 400 invalid key, 405 |
 | DELETE | `/v1/objects/{key}` | 204 no body | 404 unknown key, 400 invalid key, 405 |
 | GET | `/v1/objects?prefix=&after=&limit=` | 200 `{"items":[{"key","sha256","size","content_type"}],"next_after":<str or null>}` | 400 invalid limit, 400 invalid prefix, 400 invalid after, 405 |
-| GET | `/v1/blobs/{sha256}` | 200 raw bytes of that content, header `X-Content-Sha256` | 400 invalid sha256, 404 unknown digest, 405 |
+| GET | `/v1/blobs/{sha256}` | 200 raw bytes of that content, header `X-Content-Sha256` | 400 invalid sha256, 404 unknown digest, 405, 500 corrupted blob / blob io error |
 
 Notes:
 

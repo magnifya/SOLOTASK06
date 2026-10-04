@@ -96,6 +96,149 @@ class TestBlobAccess(StoreTestCase):
             self.store.blob("f" * 64)
 
 
+class TestBlobIntegrity(StoreTestCase):
+    def test_tampering_shapes_are_rejected(self):
+        payload = b"integrity-check-payload"
+        digest = self.store.put("k", payload)["sha256"]
+        mutations = {
+            "truncated": payload[:-3],
+            "appended": payload + b"extra",
+            "same-length": payload[:-1] + bytes([payload[-1] ^ 0xFF]),
+        }
+        for label, broken in mutations.items():
+            with open(os.path.join(self.store.blobs_dir, digest), "wb") as handle:
+                handle.write(broken)
+            with self.assertRaisesRegex(ObjectStoreError, r"\Acorrupted blob\Z"):
+                self.store.blob(digest)
+            with self.assertRaisesRegex(ObjectStoreError, r"\Acorrupted blob\Z"):
+                self.store.get("k")
+            # failed reads neither remove the file nor change metadata
+            self.assertTrue(os.path.exists(os.path.join(self.store.blobs_dir, digest)))
+            self.assertEqual(self.store.head("k")["size"], len(payload))
+            with open(os.path.join(self.store.blobs_dir, digest), "wb") as handle:
+                handle.write(payload)
+            self.assertEqual(self.store.blob(digest), payload)
+
+    def test_every_read_rechecks_disk(self):
+        digest = self.store.put("k", b"verified-now-corrupt-later")["sha256"]
+        self.assertEqual(self.store.blob(digest), b"verified-now-corrupt-later")
+        with open(os.path.join(self.store.blobs_dir, digest), "wb") as handle:
+            handle.write(b"verified-now-corrupt-later!!")
+        with self.assertRaisesRegex(ObjectStoreError, r"\Acorrupted blob\Z"):
+            self.store.blob(digest)
+
+    def test_tampered_empty_blob_is_rejected(self):
+        digest = self.store.put("empty", b"")["sha256"]
+        with open(os.path.join(self.store.blobs_dir, digest), "wb") as handle:
+            handle.write(b"x")
+        with self.assertRaisesRegex(ObjectStoreError, r"\Acorrupted blob\Z"):
+            self.store.blob(digest)
+        with self.assertRaisesRegex(ObjectStoreError, r"\Acorrupted blob\Z"):
+            self.store.get("empty")
+
+    def test_wrong_metadata_size_fails_get_but_not_blob(self):
+        payload = b"size-mismatch-case"
+        digest = self.store.put("m", payload)["sha256"]
+        index_path = os.path.join(self.root, "index.json")
+        with open(index_path, "rb") as handle:
+            document = json.loads(handle.read().decode("utf-8"))
+        document["objects"]["m"]["size"] = len(payload) + 2
+        with open(index_path, "wb") as handle:
+            handle.write(json.dumps(document).encode("utf-8"))
+        reopened = ContentAddressedStore(self.root)
+        self.assertEqual(reopened.blob(digest), payload)
+        with self.assertRaisesRegex(ObjectStoreError, r"\Acorrupted blob\Z"):
+            reopened.get("m")
+        # metadata-only operations are unaffected
+        self.assertEqual(reopened.head("m")["sha256"], digest)
+
+    def test_unreadable_existing_blob_is_io_error(self):
+        digest = self.store.put("io", b"io-test")["sha256"]
+        os.chmod(os.path.join(self.store.blobs_dir, digest), 0)
+        try:
+            if os.geteuid() == 0:
+                self.skipTest("root bypasses file permissions")
+            with self.assertRaisesRegex(ObjectStoreError, r"\Ablob io error\Z"):
+                self.store.blob(digest)
+        finally:
+            os.chmod(os.path.join(self.store.blobs_dir, digest), 0o644)
+
+
+class TestRepairOnPut(StoreTestCase):
+    def test_reput_repairs_corrupted_shared_blob(self):
+        payload = b"shared-content-for-repair"
+        digest = self.store.put("a", payload)["sha256"]
+        self.store.put("b", payload)
+        self.store.put("c", payload)
+        before_b, before_c = self.store.head("b"), self.store.head("c")
+        with open(os.path.join(self.store.blobs_dir, digest), "wb") as handle:
+            handle.write(payload[:5])
+        with self.assertRaises(ObjectStoreError):
+            self.store.get("b")
+        entry = self.store.put("a", payload, content_type="text/plain")
+        self.assertEqual(entry,
+                         {"sha256": digest, "size": len(payload),
+                          "content_type": "text/plain"})
+        self.assertEqual(self.store.blob(digest), payload)
+        # sibling metadata is untouched and the keys become readable again
+        self.assertEqual(self.store.head("b"), before_b)
+        self.assertEqual(self.store.head("c"), before_c)
+        self.assertEqual(self.store.get("b"), (payload, before_b))
+        self.assertEqual(self.store.get("c"), (payload, before_c))
+        self.assertEqual(self.store.blob_digests(), [digest])
+        # the repair itself survives reopening the data directory
+        self.assertEqual(ContentAddressedStore(self.root).get("b"), (payload, before_b))
+
+    def test_intact_shared_blob_is_not_rewritten(self):
+        payload = b"leave-intact-shared"
+        digest = self.store.put("a", payload)["sha256"]
+        path = os.path.join(self.store.blobs_dir, digest)
+        before = os.stat(path)
+        self.store.put("b", payload)
+        self.store.put("a", payload)
+        after = os.stat(path)
+        self.assertEqual((after.st_ino, after.st_mtime_ns),
+                         (before.st_ino, before.st_mtime_ns))
+        self.assertEqual(self.store.blob_digests(), [digest])
+
+    def test_failed_repair_write_leaves_mapping_and_bytes_unchanged(self):
+        import objstore.store as store_module
+        payload = b"repair-io-victim"
+        digest = self.store.put("v", payload)["sha256"]
+        with open(os.path.join(self.store.blobs_dir, digest), "wb") as handle:
+            handle.write(b"bad")
+        entry_before = self.store.head("v")
+        real_atomic_write = store_module._atomic_write
+
+        def boom(path, data):
+            if os.path.basename(path) == digest:
+                raise OSError("simulated disk failure")
+            return real_atomic_write(path, data)
+
+        store_module._atomic_write = boom
+        try:
+            with self.assertRaisesRegex(ObjectStoreError, r"\Ablob io error\Z"):
+                self.store.put("v", payload)
+        finally:
+            store_module._atomic_write = real_atomic_write
+        self.assertEqual(self.store.head("v"), entry_before)
+        with open(os.path.join(self.store.blobs_dir, digest), "rb") as handle:
+            self.assertEqual(handle.read(), b"bad")
+        # a retry with healthy I/O repairs cleanly
+        self.store.put("v", payload)
+        self.assertEqual(self.store.get("v")[0], payload)
+
+    def test_leftover_temp_file_does_not_block_reopen(self):
+        payload = b"interrupted-repair"
+        digest = self.store.put("v", payload)["sha256"]
+        leftover = os.path.join(self.store.blobs_dir, "%s.tmp.999.999" % digest)
+        with open(leftover, "wb") as handle:
+            handle.write(b"partial-new-content")
+        reopened = ContentAddressedStore(self.root)
+        self.assertEqual(reopened.get("v")[0], payload)
+        self.assertEqual(reopened.blob_digests(), [digest])
+
+
 class TestMissingAndInvalidKeys(StoreTestCase):
     def test_missing_key_operations_fail(self):
         for call in (self.store.get, self.store.head, self.store.delete):

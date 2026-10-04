@@ -138,18 +138,49 @@ class ContentAddressedStore:
         sha = hashlib.sha256(data).hexdigest()
         entry = {"sha256": sha, "size": len(data), "content_type": content_type}
         with self._lock:
-            path = os.path.join(self.blobs_dir, sha)
-            if not os.path.exists(path):
-                _atomic_write(path, data)
+            self._store_blob(sha, data)
             self._index["objects"][key] = entry
             self._save_index()
             return dict(entry)
+
+    def _store_blob(self, sha, data):
+        """Write the blob for *sha* when missing and repair it when corrupted.
+
+        An existing file is hashed on every put. Intact files are left exactly
+        as they are so dedup costs nothing extra; a file whose digest no longer
+        matches is rewritten atomically from the complete *data*, so an
+        interrupted repair leaves either the old bytes or the full new bytes.
+        """
+        path = os.path.join(self.blobs_dir, sha)
+        if os.path.exists(path):
+            try:
+                with open(path, "rb") as handle:
+                    stored = handle.read()
+            except FileNotFoundError:
+                stored = None
+            except OSError:
+                raise ObjectStoreError("blob io error")
+            if stored is not None:
+                if hashlib.sha256(stored).hexdigest() == sha:
+                    return
+                try:
+                    _atomic_write(path, data)
+                except OSError:
+                    raise ObjectStoreError("blob io error")
+                return
+        try:
+            _atomic_write(path, data)
+        except OSError:
+            raise ObjectStoreError("blob io error")
 
     def get(self, key):
         """Return ``(payload, entry)`` for *key*."""
         with self._lock:
             entry = self.head(key)
-            return self.blob(entry["sha256"]), entry
+            data = self.blob(entry["sha256"])
+            if len(data) != entry["size"]:
+                raise ObjectStoreError("corrupted blob")
+            return data, entry
 
     def head(self, key):
         """Return a copy of the metadata entry for *key*."""
@@ -170,16 +201,24 @@ class ContentAddressedStore:
             self._save_index()
 
     def blob(self, sha256):
-        """Return the raw bytes stored under digest *sha256*."""
+        """Return the raw bytes stored under digest *sha256*.
+
+        The digest of the bytes actually on disk is recomputed on every read,
+        so truncation, appended bytes and same-length tampering are all
+        rejected instead of being handed back to the caller.
+        """
         self._require_sha(sha256)
         with self._lock:
             try:
                 with open(os.path.join(self.blobs_dir, sha256), "rb") as handle:
-                    return handle.read()
+                    data = handle.read()
             except FileNotFoundError:
                 raise ObjectStoreError("not found: blob %s" % (sha256,))
-            except OSError as exc:
-                raise ObjectStoreError("blob read failed: %s" % (exc,))
+            except OSError:
+                raise ObjectStoreError("blob io error")
+            if hashlib.sha256(data).hexdigest() != sha256:
+                raise ObjectStoreError("corrupted blob")
+            return data
 
     def blob_digests(self):
         """Return the sorted digests currently present in the blob directory."""

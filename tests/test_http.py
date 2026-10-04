@@ -3,6 +3,7 @@
 import hashlib
 import http.client
 import json
+import os
 import shutil
 import tempfile
 import threading
@@ -200,6 +201,91 @@ class TestErrors(HTTPTestCase):
             conn.close()
         self.assertEqual(status, 411)
         self.assertEqual(self.document(body), {"error": "length required"})
+
+
+class TestIntegrityHTTP(unittest.TestCase):
+    """Corruption responses use an isolated store/server per test case."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="objstore-http-int-")
+        self.store = ContentAddressedStore(self.root)
+        self.server = create_server(self.store, "127.0.0.1", 0)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever,
+                                       kwargs={"poll_interval": 0.05}, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=10)
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def request(self, method, path, body=None, headers=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=15)
+        try:
+            conn.request(method, path, body=body, headers=headers or {})
+            response = conn.getresponse()
+            return response.status, response.read()
+        finally:
+            conn.close()
+
+    def _corrupt_blob(self, digest, data):
+        with open(os.path.join(self.root, "blobs", digest), "wb") as handle:
+            handle.write(data)
+
+    def _reload_store(self):
+        self.server.store = ContentAddressedStore(self.root)
+
+    def test_corrupted_object_get_is_500(self):
+        payload = b"http-corrupt-object"
+        digest = sha(payload)
+        self.assertEqual(self.request("PUT", "/v1/objects/o", payload)[0], 201)
+        self._corrupt_blob(digest, payload[:-2])
+        status, body = self.request("GET", "/v1/objects/o")
+        self.assertEqual((status, body), (500, b'{"error":"corrupted blob"}'))
+
+    def test_corrupted_blob_get_is_500(self):
+        payload = b"http-corrupt-blob"
+        digest = sha(payload)
+        self.request("PUT", "/v1/objects/b", payload)
+        self._corrupt_blob(digest, payload + b"x")
+        status, body = self.request("GET", "/v1/blobs/%s" % digest)
+        self.assertEqual((status, body), (500, b'{"error":"corrupted blob"}'))
+
+    def test_wrong_metadata_size_is_500_but_blob_read_ok(self):
+        payload = b"http-size-mismatch"
+        digest = sha(payload)
+        self.request("PUT", "/v1/objects/m", payload)
+        index_path = os.path.join(self.root, "index.json")
+        with open(index_path, "rb") as handle:
+            document = json.loads(handle.read().decode("utf-8"))
+        document["objects"]["m"]["size"] = len(payload) + 1
+        with open(index_path, "wb") as handle:
+            handle.write(json.dumps(document).encode("utf-8"))
+        self._reload_store()
+        status, body = self.request("GET", "/v1/objects/m")
+        self.assertEqual((status, body), (500, b'{"error":"corrupted blob"}'))
+        status, body = self.request("GET", "/v1/blobs/%s" % digest)
+        self.assertEqual((status, body), (200, payload))
+        # HEAD keeps its metadata-only semantics and adds no content check
+        status, body = self.request("HEAD", "/v1/objects/m")
+        self.assertEqual((status, body), (200, b""))
+
+    def test_reput_repairs_and_serves_fresh_bytes(self):
+        payload = b"http-repair"
+        digest = sha(payload)
+        self.request("PUT", "/v1/objects/o", payload, {"Content-Type": "text/plain"})
+        self.request("PUT", "/v1/objects/o2", payload)
+        self._corrupt_blob(digest, b"broken")
+        self.assertEqual(self.request("GET", "/v1/objects/o")[0], 500)
+        status, body = self.request("PUT", "/v1/objects/o", payload,
+                                    {"Content-Type": "text/plain"})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body.decode("utf-8")),
+                         {"key": "o", "sha256": digest, "size": len(payload)})
+        self.assertEqual(self.request("GET", "/v1/objects/o"), (200, payload))
+        self.assertEqual(self.request("GET", "/v1/objects/o2"), (200, payload))
 
 
 if __name__ == "__main__":
