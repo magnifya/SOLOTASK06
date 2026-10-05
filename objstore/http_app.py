@@ -1,14 +1,15 @@
 """Standard-library HTTP front end for :class:`ContentAddressedStore`.
 
 Every failure is a single-line JSON body ``{"error": "..."}`` with status 400,
-404, 405, 409, 411, 412 or 500 (500 for a corrupted blob or a blob/upload I/O
-error).
+404, 405, 409, 411, 412, 413 or 500 (500 for a corrupted blob or a blob/upload
+I/O error, 413 for a write rejected by the tenant's quota).
 
 The object and upload-session endpoints select their tenant through the
 optional ``X-Objstore-Tenant`` request header (default ``default``); the blob
 endpoints stay global and ignore it. The versioning and retention endpoints
 (``/v1/versioning``, ``/v1/objects/{key}/versions[...]``, ``/v1/retention``
-and ``/v1/retention/purge``) are tenant-scoped the same way.
+and ``/v1/retention/purge``) and the quota endpoints (``/v1/quota`` and
+``/v1/usage``) are tenant-scoped the same way.
 """
 
 from __future__ import annotations
@@ -38,6 +39,8 @@ _UPLOADS_PATH = "/v1/uploads"
 _VERSIONING_PATH = "/v1/versioning"
 _RETENTION_PATH = "/v1/retention"
 _RETENTION_PURGE_PATH = "/v1/retention/purge"
+_QUOTA_PATH = "/v1/quota"
+_USAGE_PATH = "/v1/usage"
 _TENANT_HEADER = "X-Objstore-Tenant"
 _DEFAULT_CONTENT_TYPE = "application/octet-stream"
 _DECIMAL_RE = re.compile(r"\A[0-9]+\Z")
@@ -45,11 +48,11 @@ _BAD_REQUEST_PREFIXES = (
     "invalid sha256", "invalid limit", "invalid key", "invalid prefix",
     "invalid after", "invalid size", "invalid offset", "invalid json",
     "invalid precondition", "invalid tenant", "invalid version",
-    "invalid retention", "invalid dry_run", "versioning disabled",
-    "payload", "content_type",
+    "invalid retention", "invalid dry_run", "invalid quota",
+    "versioning disabled", "payload", "content_type",
 )
 _INTERNAL_ERRORS = ("corrupted blob", "blob io error", "upload io error",
-                    "version io error")
+                    "version io error", "quota io error")
 
 
 def _json_bytes(payload):
@@ -61,6 +64,8 @@ def _status_for(message):
         return 500
     if message == "precondition failed":
         return 412
+    if message == "quota exceeded":
+        return 413
     for prefix in _BAD_REQUEST_PREFIXES:
         if message.startswith(prefix):
             return 400
@@ -192,6 +197,14 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
                 if method != "POST":
                     return self._error(405, "method not allowed")
                 return self._purge_retention(tenant)
+            if path == _QUOTA_PATH:
+                return self._quota(method, self._tenant())
+            if path == _USAGE_PATH:
+                tenant = self._tenant()
+                if method != "GET":
+                    return self._error(405, "method not allowed")
+                return self._send(200, _json_bytes(
+                    self.server.store.get_usage(tenant=tenant)))
             if path.startswith(_OBJECTS_PATH + "/"):
                 return self._object(method, unquote(path[len(_OBJECTS_PATH) + 1:]),
                                     parsed.query)
@@ -509,6 +522,34 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
             dry_run = document.get("dry_run", True)
         result = self.server.store.purge_retention(dry_run=dry_run, tenant=tenant)
         return self._send(200, _json_bytes(result))
+
+    def _quota(self, method, tenant):
+        store = self.server.store
+        if method == "GET":
+            policy = store.get_quota(tenant=tenant) or {}
+            return self._send(200, _json_bytes({
+                "max_bytes": policy.get("max_bytes"),
+                "max_objects": policy.get("max_objects"),
+            }))
+        if method == "PUT":
+            body, error = self._read_length_body()
+            if error is not None:
+                return self._error(*error)
+            document = self._json_object(body)
+            if set(document) - {"max_bytes", "max_objects"}:
+                raise ObjectStoreError("invalid quota")
+            store.set_quota(max_bytes=document.get("max_bytes"),
+                            max_objects=document.get("max_objects"),
+                            tenant=tenant)
+            return self._send(200, _json_bytes({
+                "max_bytes": document.get("max_bytes"),
+                "max_objects": document.get("max_objects"),
+            }))
+        if method == "DELETE":
+            store.clear_quota(tenant=tenant)
+            return self._send(200, _json_bytes({
+                "max_bytes": None, "max_objects": None}))
+        return self._error(405, "method not allowed")
 
     def _blob(self, sha256):
         if _SHA256_RE.match(sha256) is None:

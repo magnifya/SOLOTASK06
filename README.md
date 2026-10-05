@@ -13,7 +13,9 @@ which makes it a suitable frozen baseline for later work on chunked and
 resumable uploads, object versioning and retention, lifecycle and garbage
 collection, metadata indexing and listing, quotas and rate limiting, consistent
 hashing and rebalancing, erasure coding and repair, signed URLs and access
-control, cross-region replication and end-to-end audit.
+control, cross-region replication and end-to-end audit. Multi-tenant namespaces,
+conditional writes, resumable uploads, object versioning with retention and
+per-tenant quotas are already implemented.
 
 ## Requirements
 
@@ -301,6 +303,47 @@ non-boolean value returning `400 {"error":"invalid dry_run"}`. Object `PUT`
 and upload completion responses include `version_id` while the tenant has
 versioning enabled. The command line interface is unchanged by this feature.
 
+### Tenant quotas and usage
+
+Each tenant may carry a quota policy with at least one of two non-negative
+integer limits — anything else (both missing, booleans, negatives, other
+types or, over HTTP, unknown fields) raises `ObjectStoreError("invalid quota")`
+/ returns `400 {"error":"invalid quota"}`:
+
+```python
+store.set_quota(max_bytes=1_000_000, tenant="acme")
+store.set_quota(max_objects=100, tenant="acme")
+store.get_quota(tenant="acme")   # -> {"max_bytes":..., "max_objects":...} or None
+store.clear_quota(tenant="acme") # back to unlimited
+store.get_usage(tenant="acme")
+# -> {"used_bytes": <int>, "used_objects": <int>,
+#     "reserved_bytes": <int>, "reserved_sessions": <int>}
+```
+
+Usage is counted by logical reference, not physical dedup: every current
+object and every retained version counts once (a current pointer duplicating
+its newest version is not counted twice), keys sharing a digest count
+separately, and the same key in two tenants counts in both. Active upload
+sessions reserve their declared size in `reserved_bytes` (and count in
+`reserved_sessions`) until they complete or abort. `max_bytes` limits used
+plus reserved bytes; `max_objects` limits logical objects. A `put` or
+upload completion whose resulting usage would exceed a limit fails
+atomically with `ObjectStoreError("quota exceeded")` (HTTP
+`413 {"error":"quota exceeded"}`) before any data lands; `begin_upload`
+refuses to create a session whose reservation would exceed `max_bytes`, and
+completion releases the session's own reservation before checking. Deletes,
+version purges and aborts free quota; garbage collection never changes it.
+The policy is persisted in the index, an I/O failure while saving it raises
+`ObjectStoreError("quota io error")` (HTTP `500`), and tenants without a
+saved policy see no behaviour change in any API, HTTP path or CLI command.
+
+The HTTP surface grows two tenant-scoped endpoints (tenant selected through
+`X-Objstore-Tenant` as usual): `GET`/`PUT`/`DELETE /v1/quota` reads, saves
+or clears the policy as `{"max_bytes":..., "max_objects":...}` (unset
+limits read as `null`), and `GET /v1/usage` returns the four counters
+exactly like `get_usage`. The command line interface is unchanged by this
+feature.
+
 
 
 ## Tests
@@ -349,16 +392,16 @@ checks.
 | Method | Path | Success | Error codes |
 | --- | --- | --- | --- |
 | GET | `/healthz` | 200 `{"ok": true}` | 405 |
-| PUT | `/v1/objects/{key}` | 201 `{"key","sha256","size"}` on first store; 200 with the same body when the same bytes are stored again | 400 invalid key / invalid precondition, 411 missing Content-Length, 405, 412 precondition failed, 500 blob io error |
+| PUT | `/v1/objects/{key}` | 201 `{"key","sha256","size"}` on first store; 200 with the same body when the same bytes are stored again | 400 invalid key / invalid precondition, 411 missing Content-Length, 405, 412 precondition failed, 413 quota exceeded, 500 blob io error |
 | GET | `/v1/objects/{key}` | 200 raw bytes, headers `Content-Type`, `X-Content-Sha256` and `ETag` (`"<sha256>"`) | 404 unknown key, 400 invalid key, 405, 500 corrupted blob / blob io error |
 | HEAD | `/v1/objects/{key}` | 200 no body, headers `Content-Length`, `X-Content-Sha256` and `ETag` | 404 unknown key, 400 invalid key, 405 |
 | DELETE | `/v1/objects/{key}` | 204 no body | 404 unknown key, 400 invalid key / invalid precondition, 405, 412 precondition failed |
 | GET | `/v1/objects?prefix=&after=&limit=` | 200 `{"items":[{"key","sha256","size","content_type"}],"next_after":<str or null>}` | 400 invalid limit, 400 invalid prefix, 400 invalid after, 405 |
 | GET | `/v1/blobs/{sha256}` | 200 raw bytes of that content, header `X-Content-Sha256` | 400 invalid sha256, 404 unknown digest, 405, 500 corrupted blob / blob io error |
-| POST | `/v1/uploads` | 201 `{"session":"<id>"}`; body is a UTF-8 JSON object with required `key`, `size`, `sha256` and optional `content_type` (default `null`); optional `If-Match`/`If-None-Match` save a publish-time condition | 400 invalid json / fields / invalid precondition, 411 missing/non-integer/negative Content-Length, 400 Transfer-Encoding / truncated body, 405, 500 upload io error |
+| POST | `/v1/uploads` | 201 `{"session":"<id>"}`; body is a UTF-8 JSON object with required `key`, `size`, `sha256` and optional `content_type` (default `null`); optional `If-Match`/`If-None-Match` save a publish-time condition | 400 invalid json / fields / invalid precondition, 411 missing/non-integer/negative Content-Length, 400 Transfer-Encoding / truncated body, 405, 413 quota exceeded, 500 upload io error |
 | GET | `/v1/uploads/{session}` | 200 `{"key","size","sha256","content_type","offset","completed"}` | 404 unknown or aborted session, 405 |
 | PUT | `/v1/uploads/{session}?offset=<n>` | 200 `{"offset":<confirmed length>}`; body holds the raw chunk bytes and `offset` must be a unique non-negative decimal integer | 400 invalid/truncated framing, 404 unknown or aborted session, 409 gap/overlap/overflow/conflict/empty-chunk/completed, 411 missing/non-integer/negative Content-Length, 405, 500 upload io error |
-| POST | `/v1/uploads/{session}/complete` | 200 `{"sha256","size","content_type"}` (the first result on repeat completion); no body required | 404 unknown or aborted session, 409 incomplete or hash mismatch, 412 saved precondition failed, 400 bad framing, 405, 500 blob/upload io error |
+| POST | `/v1/uploads/{session}/complete` | 200 `{"sha256","size","content_type"}` (the first result on repeat completion); no body required | 404 unknown or aborted session, 409 incomplete or hash mismatch, 412 saved precondition failed, 413 quota exceeded, 400 bad framing, 405, 500 blob/upload io error |
 | DELETE | `/v1/uploads/{session}` | 204 no body; aborts the session and keeps any published object | 404 unknown or aborted session, 405 |
 | GET | `/v1/versioning` | 200 `{"enabled": <bool>}` for the selected tenant | 400 invalid tenant, 405 |
 | PUT | `/v1/versioning` | 200 `{"enabled": <bool>}`; body is a JSON object with a boolean `enabled` | 400 invalid json / invalid versioning, 405, 411 |
@@ -369,6 +412,10 @@ checks.
 | GET | `/v1/retention` | 200 `{"max_versions": <int|null>, "max_age_seconds": <int|null>}` | 400 invalid tenant, 405 |
 | PUT | `/v1/retention` | 200 with the saved policy; body holds at least one of the two non-negative integer limits | 400 invalid json / invalid retention, 405, 411 |
 | POST | `/v1/retention/purge` | 200 `{"versions":[...],"bytes":<int>,"dry_run":<bool>}`; optional body `{"dry_run": <bool>}` (default `true`) | 400 invalid json / invalid dry_run, 405, 500 version io error |
+| GET | `/v1/quota` | 200 `{"max_bytes": <int|null>, "max_objects": <int|null>}` for the selected tenant | 400 invalid tenant, 405 |
+| PUT | `/v1/quota` | 200 with the saved policy; body holds at least one of the two non-negative integer limits and no unknown fields | 400 invalid json / invalid quota, 405, 411, 500 quota io error |
+| DELETE | `/v1/quota` | 200 `{"max_bytes": null, "max_objects": null}`; clears the policy | 400 invalid tenant, 405, 500 quota io error |
+| GET | `/v1/usage` | 200 `{"used_bytes","used_objects","reserved_bytes","reserved_sessions"}` for the selected tenant | 400 invalid tenant, 405 |
 
 Notes:
 
@@ -427,7 +474,8 @@ Upload session notes:
                         #  "versioning":{"<tenant>":true} (only enabled tenants),
                         #  "versions":{"<tenant>":{"<key>":[{"version_id","sha256","size",
                         #  "content_type","created_at"}, ...]}} (only while non-empty),
-                        #  "retention":{"<tenant>":{"max_versions"?,"max_age_seconds"?}}}
+                        #  "retention":{"<tenant>":{"max_versions"?,"max_age_seconds"?}},
+                        #  "quota":{"<tenant>":{"max_bytes"?,"max_objects"?}}}
   blobs/<sha256>        # raw object bytes, one file per distinct digest
   uploads/<session>.json  # active upload declaration plus confirmed offset, tenant
                           # (non-default only) and optional expected_sha256 publish
@@ -440,15 +488,16 @@ tenants existed need no migration; the same applies to session files and
 completion records without a `tenant` field. Indexes written before
 versioning existed have no `versioning`, `versions` or `retention` maps, so
 every tenant starts with versioning disabled and no key gains versions it
-never wrote.
+never wrote. Indexes written before quotas existed have no `quota` map, so
+every tenant starts unlimited.
 
 ## Limits of this seed
 
 The following long-term goals are intentionally not implemented yet:
 lifecycle policies on top of the existing garbage collection of unreferenced
-blobs, quotas and rate limiting, consistent hashing and rebalancing, erasure
+blobs, rate limiting, consistent hashing and rebalancing, erasure
 coding and repair, signed URLs and access control, cross-region replication
 and end-to-end audit logging. Resumable uploads are exposed through the
 Python API and the HTTP surface; the command line interface does not expose
-them yet, and likewise exposes no versioning or retention commands.
+them yet, and likewise exposes no versioning, retention or quota commands.
 Authentication is out of scope: the server trusts every caller.
