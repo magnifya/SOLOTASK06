@@ -6,7 +6,10 @@ error).
 
 The object and upload-session endpoints select their tenant through the
 optional ``X-Objstore-Tenant`` request header (default ``default``); the blob
-endpoints stay global and ignore it.
+endpoints stay global and ignore it. The versioning and retention endpoints
+(``/v1/versioning``, ``/v1/objects/{key}/versions[/{version_id}]``,
+``/v1/retention`` and ``/v1/retention/purge``) select their tenant the same
+way.
 """
 
 from __future__ import annotations
@@ -33,15 +36,22 @@ _ETAG_RE = re.compile(r'\A"([0-9a-f]{64})"\Z')
 _OBJECTS_PATH = "/v1/objects"
 _BLOBS_PATH = "/v1/blobs"
 _UPLOADS_PATH = "/v1/uploads"
+_VERSIONING_PATH = "/v1/versioning"
+_RETENTION_PATH = "/v1/retention"
+_RETENTION_PURGE_PATH = "/v1/retention/purge"
+_VERSIONS_MARK = "/versions"
 _TENANT_HEADER = "X-Objstore-Tenant"
 _DEFAULT_CONTENT_TYPE = "application/octet-stream"
 _DECIMAL_RE = re.compile(r"\A[0-9]+\Z")
 _BAD_REQUEST_PREFIXES = (
     "invalid sha256", "invalid limit", "invalid key", "invalid prefix",
     "invalid after", "invalid size", "invalid offset", "invalid json",
-    "invalid precondition", "invalid tenant", "payload", "content_type",
+    "invalid precondition", "invalid tenant", "invalid version",
+    "invalid retention", "invalid dry_run", "versioning disabled",
+    "payload", "content_type",
 )
-_INTERNAL_ERRORS = ("corrupted blob", "blob io error", "upload io error")
+_INTERNAL_ERRORS = ("corrupted blob", "blob io error", "upload io error",
+                    "version io error")
 
 
 def _json_bytes(payload):
@@ -175,8 +185,28 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
                 if method != "GET":
                     return self._error(405, "method not allowed")
                 return self._list(parsed.query, tenant)
+            if path == _VERSIONING_PATH:
+                tenant = self._tenant()
+                return self._versioning(method, tenant)
+            if path == _RETENTION_PATH:
+                tenant = self._tenant()
+                return self._retention(method, tenant)
+            if path == _RETENTION_PURGE_PATH:
+                tenant = self._tenant()
+                return self._retention_purge(method, tenant)
             if path.startswith(_OBJECTS_PATH + "/"):
-                return self._object(method, unquote(path[len(_OBJECTS_PATH) + 1:]))
+                tail = unquote(path[len(_OBJECTS_PATH) + 1:])
+                if tail.endswith(_VERSIONS_MARK):
+                    tenant = self._tenant()
+                    if method != "GET":
+                        return self._error(405, "method not allowed")
+                    return self._list_versions(
+                        tail[:-len(_VERSIONS_MARK)], parsed.query, tenant)
+                if _VERSIONS_MARK + "/" in tail:
+                    tenant = self._tenant()
+                    key, version_id = tail.rsplit(_VERSIONS_MARK + "/", 1)
+                    return self._version(method, key, version_id, tenant)
+                return self._object(method, tail)
             if path == _UPLOADS_PATH:
                 tenant = self._tenant()
                 if self.headers.get("Transfer-Encoding") is not None:
@@ -221,6 +251,8 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
                               expected_sha256=expected, tenant=tenant)
             repeated = existing is not None and existing["sha256"] == entry["sha256"]
             body_out = {"key": key, "sha256": entry["sha256"], "size": entry["size"]}
+            if "version_id" in entry:
+                body_out["version_id"] = entry["version_id"]
             return self._send(200 if repeated else 201, _json_bytes(body_out))
         if method == "GET":
             data, entry = store.get(key, tenant=tenant)
@@ -386,6 +418,108 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
             raise ObjectStoreError("invalid sha256: %r" % (sha256,))
         return self._send(200, self.server.store.blob(sha256), _DEFAULT_CONTENT_TYPE,
                           [("X-Content-Sha256", sha256)])
+
+    # -- versioning and retention ---------------------------------------
+    def _versioning(self, method, tenant):
+        store = self.server.store
+        if method == "GET":
+            return self._send(200, _json_bytes(
+                {"enabled": store.get_versioning(tenant=tenant)}))
+        if method != "PUT":
+            return self._error(405, "method not allowed")
+        body, error = self._read_length_body()
+        if error is not None:
+            return self._error(*error)
+        document = self._json_object(body)
+        unknown = set(document) - {"enabled"}
+        if unknown:
+            raise ObjectStoreError("invalid json: unknown field %r" % (sorted(unknown)[0],))
+        if "enabled" not in document:
+            raise ObjectStoreError("invalid json: missing field 'enabled'")
+        store.set_versioning(document["enabled"], tenant=tenant)
+        return self._send(200, _json_bytes(
+            {"enabled": store.get_versioning(tenant=tenant)}))
+
+    def _list_versions(self, key, query, tenant):
+        ContentAddressedStore._check_key(key)
+        params = parse_qs(query, keep_blank_values=True)
+        raw_limit = params.get("limit", [str(DEFAULT_LIMIT)])[0]
+        try:
+            limit = int(raw_limit)
+        except (TypeError, ValueError):
+            raise ObjectStoreError("invalid limit: %r" % (raw_limit,))
+        result = self.server.store.list_versions(
+            key,
+            after=params.get("after", [None])[0] or None,
+            limit=limit,
+            tenant=tenant,
+        )
+        return self._send(200, _json_bytes(result))
+
+    def _version(self, method, key, version_id, tenant):
+        store = self.server.store
+        if method == "GET":
+            ContentAddressedStore._check_key(key)
+            data, metadata = store.get_version(key, version_id, tenant=tenant)
+            return self._send(200, data,
+                              metadata["content_type"] or _DEFAULT_CONTENT_TYPE,
+                              self._etag_headers(metadata))
+        if method == "DELETE":
+            ContentAddressedStore._check_key(key)
+            store.delete_version(key, version_id, tenant=tenant)
+            return self._send(204, b"")
+        return self._error(405, "method not allowed")
+
+    def _retention(self, method, tenant):
+        store = self.server.store
+        if method == "GET":
+            return self._send(200, _json_bytes(store.get_retention(tenant=tenant)))
+        if method != "PUT":
+            return self._error(405, "method not allowed")
+        body, error = self._read_length_body()
+        if error is not None:
+            return self._error(*error)
+        document = self._json_object(body)
+        allowed = {"max_versions", "max_age_seconds"}
+        unknown = set(document) - allowed
+        if unknown:
+            raise ObjectStoreError("invalid json: unknown field %r" % (sorted(unknown)[0],))
+        store.set_retention(max_versions=document.get("max_versions"),
+                            max_age_seconds=document.get("max_age_seconds"),
+                            tenant=tenant)
+        return self._send(200, _json_bytes(store.get_retention(tenant=tenant)))
+
+    def _retention_purge(self, method, tenant):
+        if method != "POST":
+            return self._error(405, "method not allowed")
+        # No body is required (a dry run is the default); a body, when
+        # present, must be a JSON object holding a boolean "dry_run".
+        if self.headers.get("Transfer-Encoding") is not None:
+            self.close_connection = True
+            return self._error(400, "transfer encoding not supported")
+        dry_run = True
+        raw = self.headers.get("Content-Length")
+        if raw is not None:
+            if _DECIMAL_RE.match(raw) is None:
+                self.close_connection = True
+                return self._error(400, "invalid content length")
+            length = int(raw)
+            body = self.rfile.read(length) if length else b""
+            if len(body) != length:
+                self.close_connection = True
+                return self._error(400, "truncated request body")
+            if body:
+                document = self._json_object(body)
+                unknown = set(document) - {"dry_run"}
+                if unknown:
+                    raise ObjectStoreError(
+                        "invalid json: unknown field %r" % (sorted(unknown)[0],))
+                if "dry_run" in document:
+                    if not isinstance(document["dry_run"], bool):
+                        raise ObjectStoreError("invalid dry_run")
+                    dry_run = document["dry_run"]
+        result = self.server.store.purge_retention(dry_run=dry_run, tenant=tenant)
+        return self._send(200, _json_bytes(result))
 
 
 class ObjectStoreHTTPServer(ThreadingHTTPServer):

@@ -22,6 +22,21 @@ if the session did not exist. Completing a session publishes the object in
 the session's tenant and records the result in the index's ``uploads`` map in
 one atomic index rewrite, so the completion flag can never disagree with the
 published object.
+
+Per-tenant object versioning is off by default and only affects new writes:
+while enabled for a tenant, every ``put`` and every completed resumable
+upload additionally appends an immutable version record (``version_id``,
+digest, size, content type and UTC ``created_at``) to the key's version list
+in the index's ``versions`` map and makes it the current version. ``get``,
+``head`` and ``list_objects`` keep returning only the current version, and
+``delete`` only removes the current pointer — the recorded history stays
+readable through ``list_versions``/``get_version`` until it is explicitly
+removed with ``delete_version`` or reclaimed by ``purge_retention`` under the
+tenant's saved retention policy (``retention`` map: ``max_versions`` and/or
+``max_age_seconds``). Disabling versioning never deletes history, and indexes
+written by older versions simply have no version records. Garbage collection
+treats blobs referenced by any version record, any current object and any
+incomplete upload session as live.
 """
 
 from __future__ import annotations
@@ -33,6 +48,7 @@ import re
 import stat
 import threading
 import uuid
+from datetime import datetime, timezone
 
 __all__ = ["ContentAddressedStore", "ObjectStoreError", "SessionConflict"]
 
@@ -47,6 +63,7 @@ DEFAULT_TENANT = "default"
 _SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 _SESSION_META_RE = re.compile(r"\A([0-9a-f]{32})\.json\Z")
 _TENANT_RE = re.compile(r"\A[a-z0-9][a-z0-9_-]{0,63}\Z")
+_VERSION_ID_RE = re.compile(r"\A[0-9a-f]{32}\Z")
 _MISSING = object()
 
 
@@ -65,6 +82,26 @@ class SessionConflict(ObjectStoreError):
 
 def _is_sha256(value):
     return isinstance(value, str) and _SHA256_RE.match(value) is not None
+
+
+def _is_version_id(value):
+    return isinstance(value, str) and _VERSION_ID_RE.match(value) is not None
+
+
+def _utc_now():
+    """Return the current UTC time as an ISO 8601 string with offset."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_created_at(value):
+    """Parse a stored ISO 8601 timestamp, returning an aware datetime or None."""
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed
 
 
 def _atomic_write(path, data):
@@ -96,13 +133,14 @@ class ContentAddressedStore:
         self.index_path = os.path.join(self.root, INDEX_NAME)
         self._lock = threading.RLock()
         os.makedirs(self.blobs_dir, exist_ok=True)
-        self._objects, self._upload_records = self._load_index()
+        (self._objects, self._upload_records, self._versioning,
+         self._versions, self._retention) = self._load_index()
         self._uploads = self._load_uploads()
 
     # -- index ---------------------------------------------------------
     def _load_index(self):
         if not os.path.exists(self.index_path):
-            return {DEFAULT_TENANT: {}}, {}
+            return {DEFAULT_TENANT: {}}, {}, set(), {}, {}
         try:
             with open(self.index_path, "rb") as handle:
                 document = json.loads(handle.read().decode("utf-8"))
@@ -139,7 +177,106 @@ class ContentAddressedStore:
                 "entry": self._validate_entry(key, record.get("entry")),
                 "tenant": tenant,
             }
-        return objects, records
+            version_id = record.get("version_id")
+            if version_id is not None:
+                if not _is_version_id(version_id):
+                    raise ObjectStoreError("corrupted index: bad upload record")
+                records[session_id]["version_id"] = version_id
+        versioning = self._load_versioning(document.get("versioning", {}))
+        versions = self._load_versions(document.get("versions", {}))
+        retention = self._load_retention(document.get("retention", {}))
+        return objects, records, versioning, versions, retention
+
+    @staticmethod
+    def _check_stored_tenant(tenant):
+        if not isinstance(tenant, str) or _TENANT_RE.match(tenant) is None:
+            raise ObjectStoreError("corrupted index: bad tenant")
+        return tenant
+
+    def _load_versioning(self, raw_versioning):
+        if not isinstance(raw_versioning, dict):
+            raise ObjectStoreError("corrupted index: versioning is not a map")
+        versioning = set()
+        for tenant, flag in raw_versioning.items():
+            self._check_stored_tenant(tenant)
+            if not isinstance(flag, bool):
+                raise ObjectStoreError("corrupted index: bad versioning flag")
+            if flag:
+                versioning.add(tenant)
+        return versioning
+
+    def _load_retention(self, raw_retention):
+        if not isinstance(raw_retention, dict):
+            raise ObjectStoreError("corrupted index: retention is not a map")
+        retention = {}
+        for tenant, policy in raw_retention.items():
+            self._check_stored_tenant(tenant)
+            if not isinstance(policy, dict):
+                raise ObjectStoreError("corrupted index: bad retention policy")
+            cleaned = {}
+            for field in ("max_versions", "max_age_seconds"):
+                if field not in policy:
+                    continue
+                value = policy[field]
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise ObjectStoreError("corrupted index: bad retention policy")
+                cleaned[field] = value
+            if not cleaned:
+                raise ObjectStoreError("corrupted index: empty retention policy")
+            retention[tenant] = cleaned
+        return retention
+
+    def _load_versions(self, raw_versions):
+        if not isinstance(raw_versions, dict):
+            raise ObjectStoreError("corrupted index: versions is not a map")
+        versions = {}
+        for tenant, keymap in raw_versions.items():
+            self._check_stored_tenant(tenant)
+            if not isinstance(keymap, dict):
+                raise ObjectStoreError("corrupted index: bad tenant versions")
+            loaded = {}
+            for key, info in keymap.items():
+                if not isinstance(key, str):
+                    raise ObjectStoreError("corrupted index: non-string key")
+                loaded[key] = self._validate_version_info(key, info)
+            if loaded:
+                versions[tenant] = loaded
+        return versions
+
+    @staticmethod
+    def _validate_version_info(key, info):
+        if not isinstance(info, dict):
+            raise ObjectStoreError(
+                "corrupted index: versions for %r is not an object" % (key,))
+        raw_records = info.get("versions")
+        if not isinstance(raw_records, list) or not raw_records:
+            raise ObjectStoreError(
+                "corrupted index: bad version list for %r" % (key,))
+        records = []
+        for record in raw_records:
+            if not isinstance(record, dict):
+                raise ObjectStoreError(
+                    "corrupted index: bad version record for %r" % (key,))
+            version_id = record.get("version_id")
+            if not _is_version_id(version_id):
+                raise ObjectStoreError(
+                    "corrupted index: bad version_id for %r" % (key,))
+            created_at = record.get("created_at")
+            if not isinstance(created_at, str) or _parse_created_at(created_at) is None:
+                raise ObjectStoreError(
+                    "corrupted index: bad created_at for %r" % (key,))
+            entry = ContentAddressedStore._validate_entry(key, record)
+            records.append({"version_id": version_id, "sha256": entry["sha256"],
+                            "size": entry["size"],
+                            "content_type": entry["content_type"],
+                            "created_at": created_at})
+        current = info.get("current")
+        if current is not None:
+            if not _is_version_id(current) \
+                    or current not in {record["version_id"] for record in records}:
+                raise ObjectStoreError(
+                    "corrupted index: bad current version for %r" % (key,))
+        return {"current": current, "versions": records}
 
     def _load_object_map(self, mapping):
         objects = {}
@@ -176,8 +313,28 @@ class ContentAddressedStore:
                 saved = {"key": record["key"], "entry": record["entry"]}
                 if record["tenant"] != DEFAULT_TENANT:
                     saved["tenant"] = record["tenant"]
+                if record.get("version_id") is not None:
+                    saved["version_id"] = record["version_id"]
                 records[session_id] = saved
             document["uploads"] = records
+        if self._versioning:
+            document["versioning"] = {
+                tenant: True for tenant in sorted(self._versioning)}
+        if self._retention:
+            document["retention"] = {
+                tenant: self._retention[tenant]
+                for tenant in sorted(self._retention)
+            }
+        saved_versions = {}
+        for tenant in sorted(self._versions):
+            keymap = self._versions[tenant]
+            if keymap:
+                saved_versions[tenant] = {
+                    key: {"current": info["current"], "versions": info["versions"]}
+                    for key, info in keymap.items()
+                }
+        if saved_versions:
+            document["versions"] = saved_versions
         payload = json.dumps(document, sort_keys=True, separators=(",", ":"))
         _atomic_write(self.index_path, payload.encode("utf-8") + b"\n")
 
@@ -245,6 +402,11 @@ class ContentAddressedStore:
         64 lowercase hex digest requires the key to exist with exactly that
         digest. Content type and other keys are not compared. Objects of
         other tenants are never consulted or touched.
+
+        When versioning is enabled for *tenant* the write also appends an
+        immutable version record to the key's history and the returned
+        metadata carries its ``version_id``; when disabled the behaviour and
+        the returned metadata are exactly as before.
         """
         self._check_tenant(tenant)
         self._check_key(key)
@@ -262,8 +424,37 @@ class ContentAddressedStore:
                 raise ObjectStoreError("precondition failed")
             self._store_blob(sha, data)
             self._objects.setdefault(tenant, {})[key] = entry
+            version = self._record_write(tenant, key, entry)
             self._save_index()
-            return dict(entry)
+            result = dict(entry)
+            if version is not None:
+                result["version_id"] = version["version_id"]
+            return result
+
+    def _record_write(self, tenant, key, entry):
+        """Update version history for a write of *entry* to *key*.
+
+        With versioning enabled a new immutable version is appended and made
+        current; with it disabled no version is recorded and any recorded
+        history simply stops being the current version (it is never deleted
+        implicitly). Returns the new version record or ``None``.
+        """
+        if tenant not in self._versioning:
+            info = self._versions.get(tenant, {}).get(key)
+            if info is not None:
+                info["current"] = None
+            return None
+        version = {"version_id": uuid.uuid4().hex, "sha256": entry["sha256"],
+                   "size": entry["size"], "content_type": entry["content_type"],
+                   "created_at": _utc_now()}
+        keymap = self._versions.setdefault(tenant, {})
+        info = keymap.get(key)
+        if info is None:
+            info = {"current": None, "versions": []}
+            keymap[key] = info
+        info["versions"].append(version)
+        info["current"] = version["version_id"]
+        return version
 
     def _store_blob(self, sha, data):
         """Write the blob for *sha* when missing and repair it when corrupted.
@@ -323,6 +514,12 @@ class ContentAddressedStore:
         key absent); a satisfied absent-condition delete still reports the
         key as not found. Objects other tenants keep under the same key are
         unaffected.
+
+        With versioning enabled the delete only removes the current pointer:
+        the recorded version history is kept (and stays readable through the
+        version operations) but no version is current anymore, so the key
+        disappears from ``get``/``head``/``list_objects`` until the next
+        write.
         """
         self._check_tenant(tenant)
         self._check_key(key)
@@ -335,6 +532,9 @@ class ContentAddressedStore:
                     tenant, key, expected):
                 raise ObjectStoreError("precondition failed")
             del objects[key]
+            info = self._versions.get(tenant, {}).get(key)
+            if info is not None:
+                info["current"] = None
             self._save_index()
 
     def blob(self, sha256):
@@ -667,7 +867,9 @@ class ContentAddressedStore:
         blob, so the session can be completed again (or aborted) later.
         Repeating a completed call returns the first result without touching
         the key again, so later writes or deletes of the key are never
-        overwritten.
+        overwritten. When versioning is enabled for the owning tenant the
+        publish also appends an immutable version record and the returned
+        metadata (including later repeats) carries its ``version_id``.
         """
         self._check_tenant(tenant)
         self._check_session_id(session_id)
@@ -677,7 +879,10 @@ class ContentAddressedStore:
                 if record["tenant"] != tenant:
                     raise ObjectStoreError(
                         "unknown upload session: %r" % (session_id,))
-                return dict(record["entry"])
+                result = dict(record["entry"])
+                if record.get("version_id") is not None:
+                    result["version_id"] = record["version_id"]
+                return result
             session = self._uploads.get(session_id)
             if session is None or session["tenant"] != tenant:
                 raise ObjectStoreError("unknown upload session: %r" % (session_id,))
@@ -700,9 +905,16 @@ class ContentAddressedStore:
             objects = self._objects.setdefault(tenant, {})
             previous = objects.get(session["key"], _MISSING)
             objects[session["key"]] = entry
-            self._upload_records[session_id] = {
-                "key": session["key"], "entry": dict(entry), "tenant": tenant,
-            }
+            had_keymap = tenant in self._versions
+            vinfo = self._versions.get(tenant, {}).get(session["key"])
+            v_snapshot = None if vinfo is None else (
+                list(vinfo["versions"]), vinfo["current"])
+            version = self._record_write(tenant, session["key"], entry)
+            record = {"key": session["key"], "entry": dict(entry),
+                      "tenant": tenant}
+            if version is not None:
+                record["version_id"] = version["version_id"]
+            self._upload_records[session_id] = record
             try:
                 self._save_index()
             except OSError:
@@ -711,10 +923,28 @@ class ContentAddressedStore:
                     del objects[session["key"]]
                 else:
                     objects[session["key"]] = previous
+                self._restore_write(tenant, session["key"], v_snapshot,
+                                    had_keymap)
                 raise ObjectStoreError("upload io error")
             del self._uploads[session_id]
             self._discard_session_files(session_id)
-            return dict(entry)
+            result = dict(entry)
+            if version is not None:
+                result["version_id"] = version["version_id"]
+            return result
+
+    def _restore_write(self, tenant, key, snapshot, had_keymap):
+        """Undo a ``_record_write`` after a failed index save."""
+        if snapshot is not None:
+            info = self._versions.get(tenant, {}).get(key)
+            if info is not None:
+                info["versions"], info["current"] = snapshot
+            return
+        keymap = self._versions.get(tenant)
+        if keymap is not None:
+            keymap.pop(key, None)
+            if not keymap and not had_keymap:
+                del self._versions[tenant]
 
     def abort_upload(self, session_id, tenant=DEFAULT_TENANT):
         """Drop *session_id* and return None; published objects are kept."""
@@ -754,7 +984,11 @@ class ContentAddressedStore:
 
         References are recomputed from the current object index on every
         call, across every tenant and including digest sharing between keys.
-        The whole operation runs under the store lock, so blobs published
+        Blobs referenced by recorded object versions or declared by
+        incomplete upload sessions are live as well; a version's blob becomes
+        collectable only after the version record is removed (by
+        ``delete_version`` or ``purge_retention``). The whole operation runs
+        under the store lock, so blobs published
         concurrently stay referenced and candidates that vanished between
         the scan and deletion are skipped rather than counted.
         """
@@ -766,6 +1000,12 @@ class ContentAddressedStore:
                 for objects in self._objects.values()
                 for entry in objects.values()
             }
+            for keymap in self._versions.values():
+                for info in keymap.values():
+                    for record in info["versions"]:
+                        referenced.add(record["sha256"])
+            for session in self._uploads.values():
+                referenced.add(session["sha256"])
             try:
                 names = os.listdir(self.blobs_dir)
             except OSError:
@@ -835,3 +1075,306 @@ class ContentAddressedStore:
                 for key in page
             ]
             return {"items": items, "next_after": page[-1] if len(keys) > len(page) else None}
+
+    # -- versioning ------------------------------------------------------
+    def set_versioning(self, enabled, tenant=DEFAULT_TENANT):
+        """Enable or disable object versioning for *tenant*.
+
+        *enabled* must be a boolean; anything else raises
+        ``ObjectStoreError("invalid versioning")``. The toggle only affects
+        new writes: recorded history is never deleted implicitly, and while
+        versioning is disabled ``put``/``delete``/uploads behave exactly as
+        before. The setting survives reopening the data directory.
+        """
+        self._check_tenant(tenant)
+        if not isinstance(enabled, bool):
+            raise ObjectStoreError("invalid versioning")
+        with self._lock:
+            previous = tenant in self._versioning
+            if enabled:
+                self._versioning.add(tenant)
+            else:
+                self._versioning.discard(tenant)
+            if previous == enabled:
+                return None
+            try:
+                self._save_index()
+            except OSError:
+                if previous:
+                    self._versioning.add(tenant)
+                else:
+                    self._versioning.discard(tenant)
+                raise ObjectStoreError("version io error")
+            return None
+
+    def get_versioning(self, tenant=DEFAULT_TENANT):
+        """Return whether object versioning is enabled for *tenant*."""
+        self._check_tenant(tenant)
+        with self._lock:
+            return tenant in self._versioning
+
+    def _require_versioning(self, tenant):
+        if tenant not in self._versioning:
+            raise ObjectStoreError("versioning disabled")
+
+    def _find_version(self, tenant, key, version_id):
+        """Return ``(info, record)`` for *version_id* of *key* in *tenant*.
+
+        A malformed id raises ``invalid version``; an unknown key or an
+        unknown (well-formed) id raises ``not found``.
+        """
+        if not _is_version_id(version_id):
+            raise ObjectStoreError("invalid version")
+        info = self._versions.get(tenant, {}).get(key)
+        if info is None:
+            raise ObjectStoreError("not found: %s" % (key,))
+        for record in info["versions"]:
+            if record["version_id"] == version_id:
+                return info, record
+        raise ObjectStoreError("not found: version %s" % (version_id,))
+
+    def list_versions(self, key, after=None, limit=DEFAULT_LIMIT,
+                      tenant=DEFAULT_TENANT):
+        """Return ``{"items": [...], "next_after": <str|null>}`` for one page.
+
+        Items are the key's version records newest first (reverse creation
+        order), each a mapping with ``version_id``, ``sha256``, ``size``,
+        ``created_at`` and ``current`` (true only for the version the key
+        currently returns). *after* is the exclusive ``version_id`` cursor
+        from a previous page and *limit* follows the usual rules. Requires
+        versioning to be enabled for *tenant*; a key without recorded
+        versions yields an empty page.
+        """
+        self._check_tenant(tenant)
+        self._check_key(key)
+        if after is not None and not isinstance(after, str):
+            raise ObjectStoreError("invalid after: %r" % (after,))
+        limit = self._check_limit(limit)
+        with self._lock:
+            self._require_versioning(tenant)
+            info = self._versions.get(tenant, {}).get(key)
+            records = list(info["versions"]) if info is not None else []
+            current = info["current"] if info is not None else None
+            ordered = list(reversed(records))
+            if after is not None:
+                if not _is_version_id(after):
+                    raise ObjectStoreError("invalid after: %r" % (after,))
+                position = next(
+                    (index for index, record in enumerate(ordered)
+                     if record["version_id"] == after), None)
+                if position is None:
+                    raise ObjectStoreError("invalid after: %r" % (after,))
+                ordered = ordered[position + 1:]
+            page = ordered[:limit]
+            items = [
+                {
+                    "version_id": record["version_id"],
+                    "sha256": record["sha256"],
+                    "size": record["size"],
+                    "created_at": record["created_at"],
+                    "current": record["version_id"] == current,
+                }
+                for record in page
+            ]
+            next_after = page[-1]["version_id"] if len(ordered) > len(page) else None
+            return {"items": items, "next_after": next_after}
+
+    def get_version(self, key, version_id, tenant=DEFAULT_TENANT):
+        """Return ``(payload, metadata)`` for one recorded version.
+
+        The metadata adds ``version_id``, ``created_at`` and ``current`` to
+        the usual entry fields. The blob's digest and byte count are
+        verified exactly like :meth:`get`, so corrupted storage raises the
+        usual ``corrupted blob``/``blob io error`` errors. Requires
+        versioning to be enabled for *tenant*.
+        """
+        self._check_tenant(tenant)
+        self._check_key(key)
+        with self._lock:
+            self._require_versioning(tenant)
+            info, record = self._find_version(tenant, key, version_id)
+            data = self.blob(record["sha256"])
+            if len(data) != record["size"]:
+                raise ObjectStoreError("corrupted blob")
+            metadata = dict(record)
+            metadata["current"] = record["version_id"] == info["current"]
+            return data, metadata
+
+    def delete_version(self, key, version_id, tenant=DEFAULT_TENANT):
+        """Remove one recorded version of *key* in *tenant*.
+
+        Deleting a historical (non-current) version leaves the key's current
+        object untouched. Deleting the current version promotes the newest
+        remaining version to current, and removing the last remaining
+        version makes the key disappear entirely. Requires versioning to be
+        enabled for *tenant*; the blob bytes stay on disk for garbage
+        collection.
+        """
+        self._check_tenant(tenant)
+        self._check_key(key)
+        with self._lock:
+            self._require_versioning(tenant)
+            info, record = self._find_version(tenant, key, version_id)
+            keymap = self._versions[tenant]
+            saved_records = list(info["versions"])
+            saved_current = info["current"]
+            objects = self._objects.get(tenant, {})
+            saved_object = objects.get(key, _MISSING)
+            info["versions"] = [item for item in info["versions"]
+                                if item["version_id"] != version_id]
+            was_current = saved_current == version_id
+            if not info["versions"]:
+                del keymap[key]
+                if not keymap:
+                    del self._versions[tenant]
+                if was_current:
+                    # The last version of a versioned key is gone, so the
+                    # key disappears; a current object written while
+                    # versioning was disabled is not a version and stays.
+                    objects.pop(key, None)
+            elif was_current:
+                newest = info["versions"][-1]
+                info["current"] = newest["version_id"]
+                objects[key] = {"sha256": newest["sha256"],
+                                "size": newest["size"],
+                                "content_type": newest["content_type"]}
+            try:
+                self._save_index()
+            except OSError:
+                if tenant not in self._versions:
+                    self._versions[tenant] = keymap
+                keymap[key] = info
+                info["versions"] = saved_records
+                info["current"] = saved_current
+                if saved_object is _MISSING:
+                    objects.pop(key, None)
+                else:
+                    objects[key] = saved_object
+                raise ObjectStoreError("version io error")
+
+    # -- retention -------------------------------------------------------
+    def set_retention(self, max_versions=None, max_age_seconds=None,
+                      tenant=DEFAULT_TENANT):
+        """Save the retention policy used by :meth:`purge_retention`.
+
+        Both limits must be non-negative integers (booleans rejected) and at
+        least one of them must be given; anything else raises
+        ``ObjectStoreError("invalid retention")``. The policy is stored per
+        tenant and survives reopening the data directory.
+        """
+        self._check_tenant(tenant)
+        for value in (max_versions, max_age_seconds):
+            if value is not None and (isinstance(value, bool)
+                                      or not isinstance(value, int) or value < 0):
+                raise ObjectStoreError("invalid retention")
+        if max_versions is None and max_age_seconds is None:
+            raise ObjectStoreError("invalid retention")
+        policy = {}
+        if max_versions is not None:
+            policy["max_versions"] = max_versions
+        if max_age_seconds is not None:
+            policy["max_age_seconds"] = max_age_seconds
+        with self._lock:
+            previous = self._retention.get(tenant, _MISSING)
+            self._retention[tenant] = policy
+            try:
+                self._save_index()
+            except OSError:
+                if previous is _MISSING:
+                    del self._retention[tenant]
+                else:
+                    self._retention[tenant] = previous
+                raise ObjectStoreError("version io error")
+
+    def get_retention(self, tenant=DEFAULT_TENANT):
+        """Return the tenant's saved retention policy.
+
+        Always returns a ``{"max_versions": ..., "max_age_seconds": ...}``
+        mapping, with ``None`` for limits the policy does not set.
+        """
+        self._check_tenant(tenant)
+        with self._lock:
+            policy = self._retention.get(tenant, {})
+            return {"max_versions": policy.get("max_versions"),
+                    "max_age_seconds": policy.get("max_age_seconds")}
+
+    def purge_retention(self, dry_run=True, tenant=DEFAULT_TENANT):
+        """Delete versions that violate the tenant's retention policy.
+
+        The current version of every key is always kept. Of the remaining
+        recorded versions, the oldest ones beyond ``max_versions`` per key
+        and every version older than ``max_age_seconds`` (compared against
+        the current UTC time) are removed. Returns
+        ``{"versions": [...], "bytes": <int>, "dry_run": <bool>}`` where the
+        versions are the removed ``{"key", "version_id"}`` pairs sorted by
+        ``version_id`` and bytes is the sum of their declared sizes. A dry
+        run (the default) reports the candidates without changing anything.
+        Requires a saved policy (``retention not configured`` otherwise);
+        works on recorded history whether or not versioning is currently
+        enabled for the tenant.
+        """
+        self._check_tenant(tenant)
+        if not isinstance(dry_run, bool):
+            raise ObjectStoreError("invalid dry_run")
+        with self._lock:
+            policy = self._retention.get(tenant)
+            if policy is None:
+                raise ObjectStoreError("retention not configured")
+            max_versions = policy.get("max_versions")
+            max_age = policy.get("max_age_seconds")
+            now = datetime.now(timezone.utc)
+            keymap = self._versions.get(tenant, {})
+            purged = []
+            plan = {}
+            for key in sorted(keymap):
+                info = keymap[key]
+                records = info["versions"]
+                drop = set()
+                if max_versions is not None and len(records) > max_versions:
+                    for record in records[:len(records) - max_versions]:
+                        drop.add(record["version_id"])
+                if max_age is not None:
+                    for record in records:
+                        created = _parse_created_at(record["created_at"])
+                        if created is not None and \
+                                (now - created).total_seconds() > max_age:
+                            drop.add(record["version_id"])
+                drop.discard(info["current"])
+                if not drop:
+                    continue
+                kept = [record for record in records
+                        if record["version_id"] not in drop]
+                for record in records:
+                    if record["version_id"] in drop:
+                        purged.append((record["version_id"], key,
+                                       record["size"]))
+                plan[key] = kept
+            removed = sorted(
+                ({"key": key, "version_id": version_id}
+                 for version_id, key, _ in purged),
+                key=lambda item: item["version_id"])
+            total = sum(size for _, _, size in purged)
+            if dry_run:
+                return {"versions": removed, "bytes": total, "dry_run": True}
+            snapshot = {
+                key: {"current": info["current"],
+                      "versions": list(info["versions"])}
+                for key, info in keymap.items()
+            }
+            had_keymap = tenant in self._versions
+            for key, kept in plan.items():
+                if kept:
+                    keymap[key]["versions"] = kept
+                else:
+                    del keymap[key]
+            if not keymap and had_keymap:
+                del self._versions[tenant]
+            try:
+                self._save_index()
+            except OSError:
+                if had_keymap:
+                    self._versions[tenant] = snapshot
+                else:
+                    self._versions.pop(tenant, None)
+                raise ObjectStoreError("version io error")
+            return {"versions": removed, "bytes": total, "dry_run": False}

@@ -9,11 +9,10 @@ file plus `os.replace`) so a crash never leaves a half-written index behind. The
 same core is exposed three ways: as a Python API (`ContentAddressedStore`), as a
 standard-library HTTP service, and as a command line tool. It uses only the
 Python standard library, needs no network access and behaves deterministically,
-which makes it a suitable frozen baseline for later work on chunked and
-resumable uploads, object versioning and retention, lifecycle and garbage
-collection, metadata indexing and listing, quotas and rate limiting, consistent
-hashing and rebalancing, erasure coding and repair, signed URLs and access
-control, cross-region replication and end-to-end audit.
+which makes it a suitable frozen baseline for later work on lifecycle and
+garbage collection, metadata indexing and listing, quotas and rate limiting,
+consistent hashing and rebalancing, erasure coding and repair, signed URLs
+and access control, cross-region replication and end-to-end audit.
 
 ## Requirements
 
@@ -125,6 +124,80 @@ and `GET /v1/blobs/{sha256}` keep their global meaning, and garbage
 collection only reclaims content no tenant references anymore. Directories
 written by older versions (objects, sessions and completion records without
 tenant information) belong to the `default` tenant after the upgrade.
+
+### Object versioning and retention
+
+Versioning is a per-tenant toggle, off by default. While it is off, the
+Python API, the HTTP surface, the CLI and every response are exactly as
+before; the toggle only affects new writes and never deletes recorded
+history implicitly, so indexes written by older versions need no migration
+and gain no fabricated history.
+
+```python
+store.set_versioning(True, tenant="acme")        # enable for one tenant
+store.get_versioning(tenant="acme")              # -> True
+entry = store.put("docs/a.txt", b"v1", tenant="acme")
+entry["version_id"]                              # immutable id of the new version
+page = store.list_versions("docs/a.txt", tenant="acme")
+data, meta = store.get_version("docs/a.txt", entry["version_id"], tenant="acme")
+store.delete_version("docs/a.txt", entry["version_id"], tenant="acme")
+```
+
+While versioning is enabled for a tenant, every `put` and every completed
+resumable upload appends an immutable version record (`version_id`, digest,
+size, content type and UTC `created_at`) and makes it the current version;
+`put`/`complete_upload` then also return the `version_id`. `get`, `head`
+and `list_objects` still return only the current version, and `delete` only
+removes the current pointer — the key disappears from listings while its
+whole recorded history stays readable through the version operations.
+
+`list_versions(key, after=None, limit=100, tenant=...)` returns the newest
+version first, each item carrying `version_id`, `sha256`, `size`,
+`created_at` and `current`, and paginates with the same `after`/`limit`
+convention as `list_objects` (the cursor is a `version_id`).
+`get_version(key, version_id, tenant=...)` verifies the blob's digest and
+size exactly like `get`. `delete_version` removes one recorded version:
+deleting a historical version leaves the current object untouched, deleting
+the current version promotes the newest remaining version, and deleting the
+last version makes the key disappear entirely. Calling any of these while
+versioning is disabled for the tenant raises
+`ObjectStoreError("versioning disabled")`; an unknown key or version raises
+`not found`, and a malformed `version_id` raises `invalid version`.
+
+A retention policy is saved per tenant with
+`store.set_retention(max_versions=..., max_age_seconds=..., tenant=...)`:
+both limits must be non-negative integers and at least one is required
+(`invalid retention` otherwise); `get_retention` returns the saved policy
+(`None` for unset limits). `store.purge_retention(dry_run=True, tenant=...)`
+applies the policy to the tenant's recorded history: the current version of
+every key is always kept, and versions beyond the newest `max_versions` per
+key or older than `max_age_seconds` (compared against the current UTC time)
+are deleted. It returns `{"versions": [{"key", "version_id"}...], "bytes":
+<int>, "dry_run": <bool>}` with the removed pairs sorted by `version_id`; a
+dry run (the default) changes nothing, a non-boolean `dry_run` raises
+`invalid dry_run`, a missing policy raises `retention not configured`, and
+file I/O failures raise `version io error`. Garbage collection treats blobs
+referenced by any version record, any current object and any incomplete
+upload session as live, so a version's blob becomes collectable only after
+its record is removed by `delete_version` or `purge_retention`.
+
+The HTTP surface mirrors the Python API; the tenant is selected with the
+usual `X-Objstore-Tenant` header:
+
+| Method | Path | Success | Error codes |
+| --- | --- | --- | --- |
+| GET | `/v1/versioning` | 200 `{"enabled": <bool>}` | 405 |
+| PUT | `/v1/versioning` | 200 `{"enabled": <bool>}`; body `{"enabled": <bool>}` | 400 invalid json / invalid versioning, 405, 411 |
+| GET | `/v1/objects/{key}/versions?after=&limit=` | 200 `{"items":[{"version_id","sha256","size","created_at","current"}],"next_after":<str or null>}` | 400 invalid key / invalid limit / invalid after / versioning disabled, 405 |
+| GET | `/v1/objects/{key}/versions/{version_id}` | 200 raw bytes, headers `Content-Type`, `X-Content-Sha256` and `ETag` | 400 invalid key / invalid version / versioning disabled, 404 unknown key or version, 405, 500 corrupted blob / blob io error |
+| DELETE | `/v1/objects/{key}/versions/{version_id}` | 204 no body | 400 invalid key / invalid version / versioning disabled, 404 unknown key or version, 405, 500 version io error |
+| GET | `/v1/retention` | 200 `{"max_versions": <int or null>, "max_age_seconds": <int or null>}` | 405 |
+| PUT | `/v1/retention` | 200 saved policy; body holds `max_versions` and/or `max_age_seconds` | 400 invalid json / invalid retention, 405, 411 |
+| POST | `/v1/retention/purge` | 200 `{"versions":[{"key","version_id"}...],"bytes":<int>,"dry_run":<bool>}`; optional body `{"dry_run": <bool>}` (default true) | 400 invalid json / invalid dry_run, 404 retention not configured, 405, 500 version io error |
+
+When versioning is enabled for the tenant, `PUT /v1/objects/{key}` and
+`POST /v1/uploads/{session}/complete` also return the new `version_id` in
+their JSON response; when it is disabled their responses are unchanged.
 
 ### Conditional writes
 
@@ -332,7 +405,13 @@ Upload session notes:
   index.json            # {"version":1,"objects":{"<key>":{"sha256","size","content_type"}},
                         #  "tenants":{"<tenant>":{"<key>":{...}}} (non-default tenants,
                         #  only while non-empty),
-                        #  "uploads":{"<session>":{"key","entry","tenant"?}} (only while non-empty)}
+                        #  "uploads":{"<session>":{"key","entry","tenant"?,"version_id"?}}
+                        #  (only while non-empty),
+                        #  "versioning":{"<tenant>":true} (only enabled tenants),
+                        #  "retention":{"<tenant>":{"max_versions"?,"max_age_seconds"?}},
+                        #  "versions":{"<tenant>":{"<key>":{"current":<id or null>,
+                        #  "versions":[{"version_id","sha256","size","content_type",
+                        #  "created_at"}...]}}} (only while non-empty)}
   blobs/<sha256>        # raw object bytes, one file per distinct digest
   uploads/<session>.json  # active upload declaration plus confirmed offset, tenant
                           # (non-default only) and optional expected_sha256 publish
@@ -342,12 +421,14 @@ Upload session notes:
 
 The flat `objects` map holds the `default` tenant, so indexes written before
 tenants existed need no migration; the same applies to session files and
-completion records without a `tenant` field.
+completion records without a `tenant` field. Indexes written before
+versioning existed have no `versioning`, `retention` or `versions` maps and
+simply load with versioning disabled and no recorded history.
 
 ## Limits of this seed
 
-The following long-term goals are intentionally not implemented yet: object
-versioning and retention policies, lifecycle policies on top of the existing
+The following long-term goals are intentionally not implemented yet:
+lifecycle policies on top of the existing
 garbage collection of unreferenced blobs, quotas and rate limiting, consistent
 hashing and rebalancing, erasure coding and repair, signed URLs and access
 control, cross-region replication and end-to-end audit logging. Resumable
