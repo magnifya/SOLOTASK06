@@ -208,7 +208,8 @@ lexicographically and the sum of the files' actual byte sizes (zero-byte
 blobs included). A dry run reports the candidates and changes nothing;
 `dry_run=False` deletes the candidates and reports what that call removed.
 References are recomputed from the current index on every call, so content
-still shared by any key is kept, while content orphaned by an overwrite, by
+still shared by any key, any retained object version or any incomplete
+upload session is kept, while content orphaned by an overwrite, by
 deleting the last reference, or never indexed at all is collectable. Only
 regular files directly in `blobs/` whose names are 64 lowercase hex digits
 are eligible; other names, temporary files, subdirectories and symlinks are
@@ -220,6 +221,86 @@ stating or deletion I/O failure raises `ObjectStoreError("gc io error")`; a
 failed scan deletes nothing, and a failure mid-deletion leaves the completed
 deletions in place so a retry collects the rest. Garbage collection runs
 under the same lock as object reads and writes within one store instance.
+
+### Object versioning and retention
+
+Versioning is opt-in per tenant and defaults to off; while off, every API,
+HTTP path and CLI command behaves exactly as before. The toggle only affects
+new writes — enabling or disabling it never deletes or rewrites existing
+objects or versions:
+
+```python
+store.set_versioning(True, tenant="acme")        # enable for one tenant
+store.get_versioning(tenant="acme")              # -> True
+```
+
+While a tenant has versioning enabled, every `put` and every completed
+resumable upload appends an immutable version (a random 32-hex-digit
+`version_id`, the content metadata and a UTC `created_at`) to the key's
+version list and makes it the current version; the returned metadata carries
+the new `version_id`. `get`, `head` and `list_objects` keep returning only
+the current version, and `delete` removes only the current version: the
+newest remaining version is promoted to current, and the key disappears once
+no version remains. Older versions stay readable and deletable through
+dedicated calls:
+
+```python
+page = store.list_versions("docs/a.txt", tenant="acme")
+# {"items": [{"version_id", "sha256", "size", "created_at", "current"}, ...],
+#  "next_after": <version_id or null>}   — newest first, paginate with after/limit
+data, entry = store.get_version("docs/a.txt", version_id, tenant="acme")
+entry = store.head_version("docs/a.txt", version_id, tenant="acme")
+store.delete_version("docs/a.txt", version_id, tenant="acme")
+```
+
+Version reads verify the blob digest and size exactly like `get`. A malformed
+`version_id` raises `ObjectStoreError("invalid version")`, an unknown key or
+version raises `not found`, and calling any of these while the tenant has
+versioning disabled raises `ObjectStoreError("versioning disabled")`.
+Deleting a historical version never touches the current object; deleting the
+current version promotes the newest remaining one.
+
+A retention policy is saved per tenant with at least one of two non-negative
+integer limits — anything else raises `ObjectStoreError("invalid retention")`:
+
+```python
+store.set_retention(max_versions=10, tenant="acme")
+store.set_retention(max_age_seconds=86400, tenant="acme")
+store.get_retention(tenant="acme")   # -> {"max_versions":..., "max_age_seconds":...} or None
+result = store.purge_retention(dry_run=True, tenant="acme")   # preview
+store.purge_retention(dry_run=False, tenant="acme")           # actually delete
+```
+
+`purge_retention` compares version `created_at` timestamps against the
+current UTC time and always keeps the current version of every key; of the
+remaining versions it deletes any beyond the newest `max_versions` per key or
+older than `max_age_seconds`. It returns
+`{"versions": [{"key","version_id","sha256","size","created_at"}, ...],
+"bytes": <int>, "dry_run": <bool>}` with the removed (or, for a dry run,
+removable) versions sorted by `version_id` and their total size in bytes; a
+dry run changes nothing, a missing policy yields an empty result, a
+non-boolean `dry_run` raises `ObjectStoreError("invalid dry_run")` and an
+I/O failure while saving raises `ObjectStoreError("version io error")`.
+Purged version blobs stay on disk until `collect_garbage` reclaims them —
+garbage collection treats blobs referenced by any version, any current
+object or any incomplete upload session as live.
+
+The HTTP surface grows four tenant-scoped endpoints (tenant selected through
+`X-Objstore-Tenant` as usual): `GET`/`PUT /v1/versioning` reads and sets the
+tenant's flag with a `{"enabled": <bool>}` body (a non-boolean value returns
+`400 {"error":"invalid versioning"}`); `GET /v1/objects/{key}/versions`
+lists versions newest-first as `{"items": [...], "next_after": ...}` with
+`after`/`limit` pagination, and `GET`/`HEAD`/`DELETE
+/v1/objects/{key}/versions/{version_id}` reads, inspects or deletes one
+version (GET carries `X-Content-Sha256` and `ETag` like object GET);
+`GET`/`PUT /v1/retention` reads and saves the policy as
+`{"max_versions":..., "max_age_seconds":...}` (invalid input returns
+`400 {"error":"invalid retention"}`); and `POST /v1/retention/purge` runs
+the purge with an optional `{"dry_run": <bool>}` body (default `true`), a
+non-boolean value returning `400 {"error":"invalid dry_run"}`. Object `PUT`
+and upload completion responses include `version_id` while the tenant has
+versioning enabled. The command line interface is unchanged by this feature.
+
 
 
 ## Tests
@@ -279,6 +360,15 @@ checks.
 | PUT | `/v1/uploads/{session}?offset=<n>` | 200 `{"offset":<confirmed length>}`; body holds the raw chunk bytes and `offset` must be a unique non-negative decimal integer | 400 invalid/truncated framing, 404 unknown or aborted session, 409 gap/overlap/overflow/conflict/empty-chunk/completed, 411 missing/non-integer/negative Content-Length, 405, 500 upload io error |
 | POST | `/v1/uploads/{session}/complete` | 200 `{"sha256","size","content_type"}` (the first result on repeat completion); no body required | 404 unknown or aborted session, 409 incomplete or hash mismatch, 412 saved precondition failed, 400 bad framing, 405, 500 blob/upload io error |
 | DELETE | `/v1/uploads/{session}` | 204 no body; aborts the session and keeps any published object | 404 unknown or aborted session, 405 |
+| GET | `/v1/versioning` | 200 `{"enabled": <bool>}` for the selected tenant | 400 invalid tenant, 405 |
+| PUT | `/v1/versioning` | 200 `{"enabled": <bool>}`; body is a JSON object with a boolean `enabled` | 400 invalid json / invalid versioning, 405, 411 |
+| GET | `/v1/objects/{key}/versions?after=&limit=` | 200 `{"items":[{"version_id","sha256","size","created_at","current"}],"next_after":<str or null>}`, newest first | 400 invalid key / invalid limit / invalid version / versioning disabled, 404 unknown key, 405 |
+| GET | `/v1/objects/{key}/versions/{version_id}` | 200 raw bytes of that version, headers `Content-Type`, `X-Content-Sha256` and `ETag` | 400 invalid key / invalid version / versioning disabled, 404 unknown key or version, 405, 500 corrupted blob / blob io error |
+| HEAD | `/v1/objects/{key}/versions/{version_id}` | 200 no body, headers `Content-Length`, `X-Content-Sha256` and `ETag` | 400 invalid key / invalid version / versioning disabled, 404 unknown key or version, 405 |
+| DELETE | `/v1/objects/{key}/versions/{version_id}` | 204 no body; deleting the current version promotes the newest remaining one | 400 invalid key / invalid version / versioning disabled, 404 unknown key or version, 405 |
+| GET | `/v1/retention` | 200 `{"max_versions": <int|null>, "max_age_seconds": <int|null>}` | 400 invalid tenant, 405 |
+| PUT | `/v1/retention` | 200 with the saved policy; body holds at least one of the two non-negative integer limits | 400 invalid json / invalid retention, 405, 411 |
+| POST | `/v1/retention/purge` | 200 `{"versions":[...],"bytes":<int>,"dry_run":<bool>}`; optional body `{"dry_run": <bool>}` (default `true`) | 400 invalid json / invalid dry_run, 405, 500 version io error |
 
 Notes:
 
@@ -332,7 +422,12 @@ Upload session notes:
   index.json            # {"version":1,"objects":{"<key>":{"sha256","size","content_type"}},
                         #  "tenants":{"<tenant>":{"<key>":{...}}} (non-default tenants,
                         #  only while non-empty),
-                        #  "uploads":{"<session>":{"key","entry","tenant"?}} (only while non-empty)}
+                        #  "uploads":{"<session>":{"key","entry","tenant"?,"version_id"?}}
+                        #  (only while non-empty),
+                        #  "versioning":{"<tenant>":true} (only enabled tenants),
+                        #  "versions":{"<tenant>":{"<key>":[{"version_id","sha256","size",
+                        #  "content_type","created_at"}, ...]}} (only while non-empty),
+                        #  "retention":{"<tenant>":{"max_versions"?,"max_age_seconds"?}}}
   blobs/<sha256>        # raw object bytes, one file per distinct digest
   uploads/<session>.json  # active upload declaration plus confirmed offset, tenant
                           # (non-default only) and optional expected_sha256 publish
@@ -342,15 +437,18 @@ Upload session notes:
 
 The flat `objects` map holds the `default` tenant, so indexes written before
 tenants existed need no migration; the same applies to session files and
-completion records without a `tenant` field.
+completion records without a `tenant` field. Indexes written before
+versioning existed have no `versioning`, `versions` or `retention` maps, so
+every tenant starts with versioning disabled and no key gains versions it
+never wrote.
 
 ## Limits of this seed
 
-The following long-term goals are intentionally not implemented yet: object
-versioning and retention policies, lifecycle policies on top of the existing
-garbage collection of unreferenced blobs, quotas and rate limiting, consistent
-hashing and rebalancing, erasure coding and repair, signed URLs and access
-control, cross-region replication and end-to-end audit logging. Resumable
-uploads are exposed through the Python API and the HTTP surface; the command
-line interface does not expose them yet. Authentication is out of scope: the
-server trusts every caller.
+The following long-term goals are intentionally not implemented yet:
+lifecycle policies on top of the existing garbage collection of unreferenced
+blobs, quotas and rate limiting, consistent hashing and rebalancing, erasure
+coding and repair, signed URLs and access control, cross-region replication
+and end-to-end audit logging. Resumable uploads are exposed through the
+Python API and the HTTP surface; the command line interface does not expose
+them yet, and likewise exposes no versioning or retention commands.
+Authentication is out of scope: the server trusts every caller.
