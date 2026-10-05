@@ -85,6 +85,37 @@ result = store.collect_garbage()              # preview only
 store.collect_garbage(dry_run=False)          # actually delete
 ```
 
+### Tenants
+
+Objects are namespaced per tenant: two tenants can use the same object key
+without their reads, writes, deletes or listings ever interfering. Every
+object-key operation, listing and upload-session operation of the Python API
+takes an optional ``tenant`` keyword defaulting to ``"default"``; the HTTP
+object and session endpoints take an optional ``X-Objstore-Tenant`` request
+header with the same default; and the CLI's ``put``, ``get``, ``list`` and
+``delete`` accept an optional ``--tenant``. Tenants need no prior creation —
+the first write creates the namespace implicitly — and a tenant with no
+objects simply lists an empty page. A tenant name is one to sixty-four
+lowercase letters, digits, underscores or hyphens and must start with a
+letter or digit; an invalid name (or a repeated ``X-Objstore-Tenant``
+header) fails with ``invalid tenant`` before any other validation and
+changes nothing.
+
+Conditional writes compare only the target key's digest inside the named
+tenant, listings filter and paginate within the tenant and report raw key
+names, and looking up or deleting a key that another tenant holds but this
+one does not keeps the usual not-found semantics. An upload session is
+pinned to the tenant chosen at creation: status, append, complete and abort
+must name the same tenant, and to any other tenant the session id is
+indistinguishable from an unknown one (``ObjectStoreError`` / HTTP 404, no
+state leaked, no progress changed). A saved publish condition is checked
+only against the owning tenant at completion. Blobs stay global: identical
+content is stored once no matter how many tenants reference it, garbage
+collection counts references from every tenant, and the ``blob``,
+``blob_digests`` and digest HTTP endpoints keep their global semantics.
+Objects, sessions and completion records written by older versions belong
+to the ``default`` tenant automatically.
+
 ### Conditional writes
 
 `put`, `delete` and `begin_upload` take an optional keyword
@@ -241,6 +272,12 @@ checks.
 
 Notes:
 
+* The object and upload-session endpoints accept an optional
+  `X-Objstore-Tenant` header naming the tenant namespace (default
+  `default`). A repeated header or a value that is not one to sixty-four
+  lowercase letters, digits, underscores or hyphens starting with a letter
+  or digit returns `400 {"error":"invalid tenant..."}` before any other
+  validation. The blob endpoints ignore the header and stay global.
 * `PUT` reads exactly `Content-Length` bytes from the request body; chunked
   request bodies are not supported.
 * `after` is an exclusive lower bound on the key, so the `next_after` value of a
@@ -289,12 +326,18 @@ Upload session notes:
 ```
 <data-dir>/
   index.json            # {"version":1,"objects":{"<key>":{"sha256","size","content_type"}},
-                        #  "uploads":{"<session>":{"key","entry"}}} (only while non-empty)
+                        #  "tenants":{"<tenant>":{"<key>":{...}}} (only while non-empty),
+                        #  "uploads":{"<session>":{"key","entry"[,"tenant"]}}} (only while non-empty)
   blobs/<sha256>        # raw object bytes, one file per distinct digest
-  uploads/<session>.json  # active upload declaration plus confirmed offset and
-                          # optional expected_sha256 publish condition (lazy directory)
+  uploads/<session>.json  # active upload declaration plus confirmed offset, tenant
+                          # (non-default only) and optional expected_sha256 publish
+                          # condition (lazy directory)
   uploads/<session>.part  # received bytes of an active upload
 ```
+
+The flat ``objects`` map is the ``default`` tenant's namespace, exactly the
+format older versions wrote, so existing data directories need no migration;
+every other tenant gets its own key map under ``tenants``.
 
 ## Limits of this seed
 

@@ -14,7 +14,7 @@ import signal
 import sys
 
 from .http_app import create_server
-from .store import DEFAULT_LIMIT, ContentAddressedStore, ObjectStoreError
+from .store import DEFAULT_LIMIT, DEFAULT_TENANT, ContentAddressedStore, ObjectStoreError
 
 __all__ = ["build_parser", "main"]
 
@@ -45,18 +45,26 @@ def build_parser():
     put.add_argument("--key", required=True)
     put.add_argument("--file", required=True)
     put.add_argument("--content-type", default=None)
+    put.add_argument("--tenant", default=DEFAULT_TENANT,
+                     help="tenant namespace for the key (default: %(default)s)")
 
     get = sub.add_parser("get", help="write a stored object to a local file")
     get.add_argument("--key", required=True)
     get.add_argument("--out", required=True)
+    get.add_argument("--tenant", default=DEFAULT_TENANT,
+                     help="tenant namespace for the key (default: %(default)s)")
 
     listing = sub.add_parser("list", help="list object keys in lexicographic order")
     listing.add_argument("--prefix", default="")
     listing.add_argument("--after", default=None)
     listing.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
+    listing.add_argument("--tenant", default=DEFAULT_TENANT,
+                         help="tenant namespace to list (default: %(default)s)")
 
     delete = sub.add_parser("delete", help="delete a key")
     delete.add_argument("--key", required=True)
+    delete.add_argument("--tenant", default=DEFAULT_TENANT,
+                        help="tenant namespace for the key (default: %(default)s)")
 
     gc = sub.add_parser("gc", help="garbage-collect unreferenced blobs (preview unless --execute)")
     gc.add_argument("--execute", action="store_true",
@@ -102,13 +110,14 @@ def _cmd_serve(args, store):
 def _cmd_put(args, store):
     with open(args.file, "rb") as handle:
         payload = handle.read()
-    entry = store.put(args.key, payload, content_type=args.content_type)
+    entry = store.put(args.key, payload, content_type=args.content_type,
+                      tenant=args.tenant)
     _emit({"ok": True, "key": args.key, "sha256": entry["sha256"], "size": entry["size"]})
     return 0
 
 
 def _cmd_get(args, store):
-    data, entry = store.get(args.key)
+    data, entry = store.get(args.key, tenant=args.tenant)
     directory = os.path.dirname(os.path.abspath(args.out))
     if directory:
         os.makedirs(directory, exist_ok=True)
@@ -120,13 +129,14 @@ def _cmd_get(args, store):
 
 
 def _cmd_list(args, store):
-    result = store.list_objects(prefix=args.prefix, after=args.after, limit=args.limit)
+    result = store.list_objects(prefix=args.prefix, after=args.after,
+                                limit=args.limit, tenant=args.tenant)
     _emit({"ok": True, "items": result["items"], "next_after": result["next_after"]})
     return 0
 
 
 def _cmd_delete(args, store):
-    store.delete(args.key)
+    store.delete(args.key, tenant=args.tenant)
     _emit({"ok": True, "key": args.key, "deleted": True})
     return 0
 
