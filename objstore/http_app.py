@@ -3,6 +3,10 @@
 Every failure is a single-line JSON body ``{"error": "..."}`` with status 400,
 404, 405, 409, 411, 412 or 500 (500 for a corrupted blob or a blob/upload I/O
 error).
+
+The object and upload-session endpoints select their tenant through the
+optional ``X-Objstore-Tenant`` request header (default ``default``); the blob
+endpoints stay global and ignore it.
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from .store import (
     DEFAULT_LIMIT,
+    DEFAULT_TENANT,
     ContentAddressedStore,
     ObjectStoreError,
     SessionConflict,
@@ -28,12 +33,13 @@ _ETAG_RE = re.compile(r'\A"([0-9a-f]{64})"\Z')
 _OBJECTS_PATH = "/v1/objects"
 _BLOBS_PATH = "/v1/blobs"
 _UPLOADS_PATH = "/v1/uploads"
+_TENANT_HEADER = "X-Objstore-Tenant"
 _DEFAULT_CONTENT_TYPE = "application/octet-stream"
 _DECIMAL_RE = re.compile(r"\A[0-9]+\Z")
 _BAD_REQUEST_PREFIXES = (
     "invalid sha256", "invalid limit", "invalid key", "invalid prefix",
     "invalid after", "invalid size", "invalid offset", "invalid json",
-    "invalid precondition", "payload", "content_type",
+    "invalid precondition", "invalid tenant", "payload", "content_type",
 )
 _INTERNAL_ERRORS = ("corrupted blob", "blob io error", "upload io error")
 
@@ -91,6 +97,27 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
             return None
         return self.rfile.read(length) if length else b""
 
+    def _tenant(self):
+        """Return the tenant selected by the ``X-Objstore-Tenant`` header.
+
+        The header is optional and defaults to ``default``; a repeated
+        header or an invalid name is an ``invalid tenant`` error that takes
+        precedence over every other request problem. The connection is
+        closed on such an error because an unread request body may still be
+        pending and would otherwise be parsed as the next request.
+        """
+        values = self.headers.get_all(_TENANT_HEADER) or []
+        if len(values) > 1:
+            self.close_connection = True
+            raise ObjectStoreError("invalid tenant: repeated header")
+        tenant = values[0] if values else DEFAULT_TENANT
+        try:
+            ContentAddressedStore._check_tenant(tenant)
+        except ObjectStoreError:
+            self.close_connection = True
+            raise
+        return tenant
+
     def _precondition_headers(self):
         """Map If-Match / If-None-Match onto an ``expected_sha256`` argument.
 
@@ -144,21 +171,25 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
                     return self._error(405, "method not allowed")
                 return self._send(200, _json_bytes({"ok": True}))
             if path == _OBJECTS_PATH:
+                tenant = self._tenant()
                 if method != "GET":
                     return self._error(405, "method not allowed")
-                return self._list(parsed.query)
+                return self._list(parsed.query, tenant)
             if path.startswith(_OBJECTS_PATH + "/"):
                 return self._object(method, unquote(path[len(_OBJECTS_PATH) + 1:]))
             if path == _UPLOADS_PATH:
+                tenant = self._tenant()
                 if self.headers.get("Transfer-Encoding") is not None:
                     self.close_connection = True
                     return self._error(400, "transfer encoding not supported")
                 if method != "POST":
                     return self._error(405, "method not allowed")
-                return self._create_upload()
+                return self._create_upload(tenant)
             if path.startswith(_UPLOADS_PATH + "/"):
+                tenant = self._tenant()
                 return self._upload_session(
-                    method, unquote(path[len(_UPLOADS_PATH) + 1:]), parsed.query)
+                    method, unquote(path[len(_UPLOADS_PATH) + 1:]), parsed.query,
+                    tenant)
             if path.startswith(_BLOBS_PATH + "/"):
                 if method != "GET":
                     return self._error(405, "method not allowed")
@@ -172,6 +203,7 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
             return None
 
     def _object(self, method, key):
+        tenant = self._tenant()
         if not key:
             return self._error(400, "invalid key")
         store = self.server.store
@@ -182,27 +214,27 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
             ContentAddressedStore._check_key(key)
             expected = self._precondition_headers()
             try:
-                existing = store.head(key)
+                existing = store.head(key, tenant=tenant)
             except ObjectStoreError:
                 existing = None
             entry = store.put(key, body, content_type=self.headers.get("Content-Type"),
-                              expected_sha256=expected)
+                              expected_sha256=expected, tenant=tenant)
             repeated = existing is not None and existing["sha256"] == entry["sha256"]
             body_out = {"key": key, "sha256": entry["sha256"], "size": entry["size"]}
             return self._send(200 if repeated else 201, _json_bytes(body_out))
         if method == "GET":
-            data, entry = store.get(key)
+            data, entry = store.get(key, tenant=tenant)
             return self._send(200, data, entry["content_type"] or _DEFAULT_CONTENT_TYPE,
                               self._etag_headers(entry))
         if method == "HEAD":
-            entry = store.head(key)
+            entry = store.head(key, tenant=tenant)
             return self._send(200, b"", entry["content_type"] or _DEFAULT_CONTENT_TYPE,
                               self._etag_headers(entry), head_only=True,
                               length=entry["size"])
         if method == "DELETE":
             ContentAddressedStore._check_key(key)
             expected = self._precondition_headers()
-            store.delete(key, expected_sha256=expected)
+            store.delete(key, expected_sha256=expected, tenant=tenant)
             return self._send(204, b"")
         return self._error(405, "method not allowed")
 
@@ -253,7 +285,7 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
             raise ObjectStoreError("invalid offset")
         return int(values[0])
 
-    def _create_upload(self):
+    def _create_upload(self, tenant):
         body, error = self._read_length_body()
         if error is not None:
             return self._error(*error)
@@ -278,10 +310,10 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
         expected = self._precondition_headers()
         session_id = self.server.store.begin_upload(
             key, size, digest, content_type=content_type,
-            expected_sha256=expected)
+            expected_sha256=expected, tenant=tenant)
         return self._send(201, _json_bytes({"session": session_id}))
 
-    def _upload_session(self, method, tail, query):
+    def _upload_session(self, method, tail, query, tenant):
         # Transfer-Encoding is rejected before method/session validation.
         if self.headers.get("Transfer-Encoding") is not None:
             self.close_connection = True
@@ -290,19 +322,20 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
         if not session_id:
             return self._error(404, "not found")
         if not sep:
-            return self._upload_session_item(method, session_id, query)
+            return self._upload_session_item(method, session_id, query, tenant)
         if sub == "complete":
             if method != "POST":
                 return self._error(405, "method not allowed")
-            return self._complete_upload(session_id)
+            return self._complete_upload(session_id, tenant)
         return self._error(404, "not found")
 
-    def _upload_session_item(self, method, session_id, query):
+    def _upload_session_item(self, method, session_id, query, tenant):
         store = self.server.store
         if method == "GET":
-            return self._send(200, _json_bytes(store.upload_status(session_id)))
+            return self._send(200, _json_bytes(
+                store.upload_status(session_id, tenant=tenant)))
         if method == "DELETE":
-            store.abort_upload(session_id)
+            store.abort_upload(session_id, tenant=tenant)
             return self._send(204, b"")
         if method != "PUT":
             return self._error(405, "method not allowed")
@@ -310,10 +343,10 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
         if error is not None:
             return self._error(*error)
         offset = self._offset_param(query)
-        confirmed = store.append_upload(session_id, offset, body)
+        confirmed = store.append_upload(session_id, offset, body, tenant=tenant)
         return self._send(200, _json_bytes({"offset": confirmed}))
 
-    def _complete_upload(self, session_id):
+    def _complete_upload(self, session_id, tenant):
         # No body is required, but framing headers still have to be sane and
         # any declared bytes are drained so the connection can be reused.
         if self.headers.get("Transfer-Encoding") is not None:
@@ -330,10 +363,10 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
                 if len(drained) != length:
                     self.close_connection = True
                     return self._error(400, "truncated request body")
-        entry = self.server.store.complete_upload(session_id)
+        entry = self.server.store.complete_upload(session_id, tenant=tenant)
         return self._send(200, _json_bytes(entry))
 
-    def _list(self, query):
+    def _list(self, query, tenant):
         params = parse_qs(query, keep_blank_values=True)
         raw_limit = params.get("limit", [str(DEFAULT_LIMIT)])[0]
         try:
@@ -344,6 +377,7 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
             prefix=params.get("prefix", [""])[0],
             after=params.get("after", [None])[0] or None,
             limit=limit,
+            tenant=tenant,
         )
         return self._send(200, _json_bytes(result))
 

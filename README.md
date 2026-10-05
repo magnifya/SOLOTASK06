@@ -68,9 +68,10 @@ python3 -m objstore --data-dir ./objstore_data gc --execute
 ```
 
 The global `--data-dir` option must appear before the subcommand; it defaults to
-`./objstore_data`. Every command prints exactly one line of JSON on stdout and
-exits 0 on success, or prints one line of JSON on stderr and exits non-zero on
-failure.
+`./objstore_data`. `put`, `get`, `list` and `delete` also accept `--tenant`
+(default `default`) to pick the tenant namespace. Every command prints exactly
+one line of JSON on stdout and exits 0 on success, or prints one line of JSON
+on stderr and exits non-zero on failure.
 
 Use the Python API directly:
 
@@ -84,6 +85,46 @@ page = store.list_objects(prefix="docs/", after=None, limit=100)
 result = store.collect_garbage()              # preview only
 store.collect_garbage(dry_run=False)          # actually delete
 ```
+
+### Tenants
+
+Every object key lives in a tenant namespace. Two tenants may use the same
+key for independent objects: reads, writes, deletes, conditional writes and
+listings of one tenant never see or affect another tenant's objects. Tenants
+need no provisioning — a tenant exists as soon as it has objects or sessions,
+and listing a tenant without objects returns an empty page. A tenant name is
+1–64 characters of lowercase letters, digits, `_` or `-`, starting with a
+letter or digit; anything else raises `ObjectStoreError("invalid tenant: ...")`
+(Python), returns `400 {"error":"invalid tenant ..."}` (HTTP) or the usual
+CLI failure line with a non-zero exit, and changes no data.
+
+The Python API takes an optional `tenant` keyword (default `"default"`) on
+`put`, `get`, `head`, `delete`, `list_objects` and every upload-session
+operation:
+
+```python
+store.put("docs/a.txt", b"hello", tenant="acme")
+payload, head = store.get("docs/a.txt", tenant="acme")
+page = store.list_objects(prefix="docs/", tenant="acme")
+session = store.begin_upload("docs/big.bin", size, digest, tenant="acme")
+```
+
+The HTTP object and upload-session endpoints select the tenant through the
+optional `X-Objstore-Tenant` request header (default `default`); a repeated
+header or an invalid name returns `400 {"error":"invalid tenant ..."}` and
+takes precedence over every other request error. The CLI commands `put`,
+`get`, `list` and `delete` accept an optional `--tenant` flag.
+
+A conditional write compares only the digest of the key in the same tenant,
+and an upload session belongs to the tenant fixed at creation: its status,
+append, complete and abort operations must name that tenant, and a valid
+session id of another tenant behaves exactly like an unknown session id
+(`ObjectStoreError` / `404`) without revealing any state. Blobs stay global —
+identical content is stored once across all tenants, `blob`/`blob_digests`
+and `GET /v1/blobs/{sha256}` keep their global meaning, and garbage
+collection only reclaims content no tenant references anymore. Directories
+written by older versions (objects, sessions and completion records without
+tenant information) belong to the `default` tenant after the upgrade.
 
 ### Conditional writes
 
@@ -289,12 +330,19 @@ Upload session notes:
 ```
 <data-dir>/
   index.json            # {"version":1,"objects":{"<key>":{"sha256","size","content_type"}},
-                        #  "uploads":{"<session>":{"key","entry"}}} (only while non-empty)
+                        #  "tenants":{"<tenant>":{"<key>":{...}}} (non-default tenants,
+                        #  only while non-empty),
+                        #  "uploads":{"<session>":{"key","entry","tenant"?}} (only while non-empty)}
   blobs/<sha256>        # raw object bytes, one file per distinct digest
-  uploads/<session>.json  # active upload declaration plus confirmed offset and
-                          # optional expected_sha256 publish condition (lazy directory)
+  uploads/<session>.json  # active upload declaration plus confirmed offset, tenant
+                          # (non-default only) and optional expected_sha256 publish
+                          # condition (lazy directory)
   uploads/<session>.part  # received bytes of an active upload
 ```
+
+The flat `objects` map holds the `default` tenant, so indexes written before
+tenants existed need no migration; the same applies to session files and
+completion records without a `tenant` field.
 
 ## Limits of this seed
 

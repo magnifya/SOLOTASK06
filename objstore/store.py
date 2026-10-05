@@ -5,10 +5,21 @@ Blob bytes are stored once as ``<root>/blobs/<sha256>``; object metadata
 always rewritten through a temporary file plus ``os.replace``. Every mutation
 and every consistent read runs under a single re-entrant lock.
 
+Objects are namespaced per tenant: every object and upload operation takes an
+optional ``tenant`` keyword defaulting to ``"default"``, and the same key in
+different tenants refers to independent objects. In the index the default
+tenant keeps the historical flat ``objects`` map while other tenants are
+stored under a ``tenants`` map, so directories written by older versions
+silently belong to the default tenant. Blobs stay global: identical content
+is stored once no matter which tenants reference it, and garbage collection
+considers the references of every tenant.
+
 Resumable uploads live under ``<root>/uploads/`` (created lazily): each
 session is a ``<session>.json`` declaration plus confirmed offset and a
-``<session>.part`` file holding the received bytes. Completing a session
-publishes the object and records the result in the index's ``uploads`` map in
+``<session>.part`` file holding the received bytes. A session belongs to the
+tenant fixed at creation; operations naming another tenant behave exactly as
+if the session did not exist. Completing a session publishes the object in
+the session's tenant and records the result in the index's ``uploads`` map in
 one atomic index rewrite, so the completion flag can never disagree with the
 published object.
 """
@@ -31,9 +42,11 @@ UPLOADS_DIRNAME = "uploads"
 INDEX_VERSION = 1
 DEFAULT_LIMIT = 100
 MAX_LIMIT = 1000
+DEFAULT_TENANT = "default"
 
 _SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 _SESSION_META_RE = re.compile(r"\A([0-9a-f]{32})\.json\Z")
+_TENANT_RE = re.compile(r"\A[a-z0-9][a-z0-9_-]{0,63}\Z")
 _MISSING = object()
 
 
@@ -83,13 +96,13 @@ class ContentAddressedStore:
         self.index_path = os.path.join(self.root, INDEX_NAME)
         self._lock = threading.RLock()
         os.makedirs(self.blobs_dir, exist_ok=True)
-        self._index, self._upload_records = self._load_index()
+        self._objects, self._upload_records = self._load_index()
         self._uploads = self._load_uploads()
 
     # -- index ---------------------------------------------------------
     def _load_index(self):
         if not os.path.exists(self.index_path):
-            return {"version": INDEX_VERSION, "objects": {}}, {}
+            return {DEFAULT_TENANT: {}}, {}
         try:
             with open(self.index_path, "rb") as handle:
                 document = json.loads(handle.read().decode("utf-8"))
@@ -97,11 +110,17 @@ class ContentAddressedStore:
             raise ObjectStoreError("corrupted index: %s" % (exc,))
         if not isinstance(document, dict) or not isinstance(document.get("objects"), dict):
             raise ObjectStoreError("corrupted index: missing objects map")
-        objects = {}
-        for key, entry in document["objects"].items():
-            if not isinstance(key, str):
-                raise ObjectStoreError("corrupted index: non-string key")
-            objects[key] = self._validate_entry(key, entry)
+        objects = {DEFAULT_TENANT: self._load_object_map(document["objects"])}
+        raw_tenants = document.get("tenants", {})
+        if not isinstance(raw_tenants, dict):
+            raise ObjectStoreError("corrupted index: tenants is not a map")
+        for tenant, mapping in raw_tenants.items():
+            if not isinstance(tenant, str) or tenant == DEFAULT_TENANT \
+                    or _TENANT_RE.match(tenant) is None:
+                raise ObjectStoreError("corrupted index: bad tenant")
+            if not isinstance(mapping, dict):
+                raise ObjectStoreError("corrupted index: bad tenant objects")
+            objects[tenant] = self._load_object_map(mapping)
         records = {}
         raw_records = document.get("uploads", {})
         if not isinstance(raw_records, dict):
@@ -112,11 +131,23 @@ class ContentAddressedStore:
             key = record.get("key")
             if not isinstance(key, str):
                 raise ObjectStoreError("corrupted index: bad upload record")
+            tenant = record.get("tenant", DEFAULT_TENANT)
+            if not isinstance(tenant, str) or _TENANT_RE.match(tenant) is None:
+                raise ObjectStoreError("corrupted index: bad upload record")
             records[session_id] = {
                 "key": key,
                 "entry": self._validate_entry(key, record.get("entry")),
+                "tenant": tenant,
             }
-        return {"version": INDEX_VERSION, "objects": objects}, records
+        return objects, records
+
+    def _load_object_map(self, mapping):
+        objects = {}
+        for key, entry in mapping.items():
+            if not isinstance(key, str):
+                raise ObjectStoreError("corrupted index: non-string key")
+            objects[key] = self._validate_entry(key, entry)
+        return objects
 
     @staticmethod
     def _validate_entry(key, entry):
@@ -133,13 +164,30 @@ class ContentAddressedStore:
         return {"sha256": sha, "size": size, "content_type": content_type}
 
     def _save_index(self):
-        document = {"version": INDEX_VERSION, "objects": self._index["objects"]}
+        document = {"version": INDEX_VERSION,
+                    "objects": self._objects.get(DEFAULT_TENANT, {})}
+        tenants = {tenant: mapping for tenant, mapping in self._objects.items()
+                   if tenant != DEFAULT_TENANT and mapping}
+        if tenants:
+            document["tenants"] = tenants
         if self._upload_records:
-            document["uploads"] = self._upload_records
+            records = {}
+            for session_id, record in self._upload_records.items():
+                saved = {"key": record["key"], "entry": record["entry"]}
+                if record["tenant"] != DEFAULT_TENANT:
+                    saved["tenant"] = record["tenant"]
+                records[session_id] = saved
+            document["uploads"] = records
         payload = json.dumps(document, sort_keys=True, separators=(",", ":"))
         _atomic_write(self.index_path, payload.encode("utf-8") + b"\n")
 
     # -- validation ----------------------------------------------------
+    @staticmethod
+    def _check_tenant(tenant):
+        if not isinstance(tenant, str) or _TENANT_RE.match(tenant) is None:
+            raise ObjectStoreError("invalid tenant: %r" % (tenant,))
+        return tenant
+
     @staticmethod
     def _check_key(key):
         if not isinstance(key, str) or not key or "\x00" in key:
@@ -179,23 +227,26 @@ class ContentAddressedStore:
             return expected_sha256
         raise ObjectStoreError("invalid precondition")
 
-    def _precondition_met(self, key, expected):
-        """Return whether *key* currently satisfies the *expected* condition."""
-        entry = self._index["objects"].get(key)
+    def _precondition_met(self, tenant, key, expected):
+        """Return whether *key* in *tenant* currently satisfies *expected*."""
+        entry = self._objects.get(tenant, {}).get(key)
         if expected is None:
             return entry is None
         return entry is not None and entry["sha256"] == expected
 
     # -- object API ----------------------------------------------------
-    def put(self, key, payload, content_type=None, expected_sha256=_MISSING):
-        """Store *payload* under *key* and return its metadata entry.
+    def put(self, key, payload, content_type=None, expected_sha256=_MISSING,
+            tenant=DEFAULT_TENANT):
+        """Store *payload* under *key* in *tenant* and return its metadata.
 
         *expected_sha256* is an atomic precondition on the key's current
-        digest: omitted leaves the old overwrite behaviour, an explicit
-        ``None`` requires the key not to exist, and a 64 lowercase hex digest
-        requires the key to exist with exactly that digest. Content type and
-        other keys are not compared.
+        digest in the same tenant: omitted leaves the old overwrite
+        behaviour, an explicit ``None`` requires the key not to exist, and a
+        64 lowercase hex digest requires the key to exist with exactly that
+        digest. Content type and other keys are not compared. Objects of
+        other tenants are never consulted or touched.
         """
+        self._check_tenant(tenant)
         self._check_key(key)
         if not isinstance(payload, (bytes, bytearray, memoryview)):
             raise ObjectStoreError("payload must be bytes")
@@ -206,10 +257,11 @@ class ContentAddressedStore:
         sha = hashlib.sha256(data).hexdigest()
         entry = {"sha256": sha, "size": len(data), "content_type": content_type}
         with self._lock:
-            if expected is not _MISSING and not self._precondition_met(key, expected):
+            if expected is not _MISSING and not self._precondition_met(
+                    tenant, key, expected):
                 raise ObjectStoreError("precondition failed")
             self._store_blob(sha, data)
-            self._index["objects"][key] = entry
+            self._objects.setdefault(tenant, {})[key] = entry
             self._save_index()
             return dict(entry)
 
@@ -243,39 +295,46 @@ class ContentAddressedStore:
         except OSError:
             raise ObjectStoreError("blob io error")
 
-    def get(self, key):
-        """Return ``(payload, entry)`` for *key*."""
+    def get(self, key, tenant=DEFAULT_TENANT):
+        """Return ``(payload, entry)`` for *key* in *tenant*."""
+        self._check_tenant(tenant)
         with self._lock:
-            entry = self.head(key)
+            entry = self.head(key, tenant=tenant)
             data = self.blob(entry["sha256"])
             if len(data) != entry["size"]:
                 raise ObjectStoreError("corrupted blob")
             return data, entry
 
-    def head(self, key):
-        """Return a copy of the metadata entry for *key*."""
+    def head(self, key, tenant=DEFAULT_TENANT):
+        """Return a copy of the metadata entry for *key* in *tenant*."""
+        self._check_tenant(tenant)
         self._check_key(key)
         with self._lock:
-            entry = self._index["objects"].get(key)
+            entry = self._objects.get(tenant, {}).get(key)
             if entry is None:
                 raise ObjectStoreError("not found: %s" % (key,))
             return dict(entry)
 
-    def delete(self, key, expected_sha256=_MISSING):
-        """Drop *key*; shared blobs stay on disk for the keys still using them.
+    def delete(self, key, expected_sha256=_MISSING, tenant=DEFAULT_TENANT):
+        """Drop *key* in *tenant*; shared blobs stay on disk for other keys.
 
         With *expected_sha256*, deletion also requires the key's current
-        digest to match (or an explicit ``None`` requires the key absent); a
-        satisfied absent-condition delete still reports the key as not found.
+        digest in this tenant to match (or an explicit ``None`` requires the
+        key absent); a satisfied absent-condition delete still reports the
+        key as not found. Objects other tenants keep under the same key are
+        unaffected.
         """
+        self._check_tenant(tenant)
         self._check_key(key)
         expected = self._check_precondition(expected_sha256)
         with self._lock:
-            if key not in self._index["objects"]:
+            objects = self._objects.get(tenant, {})
+            if key not in objects:
                 raise ObjectStoreError("not found: %s" % (key,))
-            if expected is not _MISSING and not self._precondition_met(key, expected):
+            if expected is not _MISSING and not self._precondition_met(
+                    tenant, key, expected):
                 raise ObjectStoreError("precondition failed")
-            del self._index["objects"][key]
+            del objects[key]
             self._save_index()
 
     def blob(self, sha256):
@@ -346,10 +405,13 @@ class ContentAddressedStore:
         content_type = document.get("content_type")
         offset = document.get("offset")
         expected = document.get("expected_sha256", _MISSING)
+        tenant = document.get("tenant", DEFAULT_TENANT)
         try:
             self._check_key(key)
         except ObjectStoreError:
             raise ObjectStoreError("corrupted upload session: bad key")
+        if not isinstance(tenant, str) or _TENANT_RE.match(tenant) is None:
+            raise ObjectStoreError("corrupted upload session: bad tenant")
         if isinstance(size, bool) or not isinstance(size, int) or size < 0:
             raise ObjectStoreError("corrupted upload session: bad size")
         if not _is_sha256(sha):
@@ -364,7 +426,7 @@ class ContentAddressedStore:
             raise ObjectStoreError("corrupted upload session: bad precondition")
         return {"key": key, "size": size, "sha256": sha,
                 "content_type": content_type, "offset": offset,
-                "expected_sha256": expected}
+                "expected_sha256": expected, "tenant": tenant}
 
     def _check_part_file(self, session_id, offset):
         """Ensure the part file holds exactly the confirmed *offset* bytes.
@@ -399,8 +461,11 @@ class ContentAddressedStore:
                 raise ObjectStoreError("upload io error")
 
     def _save_session(self, session_id, session):
+        # The default tenant is implicit so older session files stay
+        # byte-identical; every other tenant is recorded explicitly.
         document = {name: value for name, value in session.items()
-                    if value is not _MISSING}
+                    if value is not _MISSING
+                    and not (name == "tenant" and value == DEFAULT_TENANT)}
         payload = json.dumps(document, sort_keys=True, separators=(",", ":"))
         try:
             _atomic_write(self._session_meta_path(session_id),
@@ -467,30 +532,35 @@ class ContentAddressedStore:
             raise ObjectStoreError("invalid upload session: %r" % (session_id,))
         return session_id
 
-    def _require_active_session(self, session_id):
+    def _require_active_session(self, session_id, tenant):
         self._check_session_id(session_id)
-        if session_id in self._upload_records:
+        record = self._upload_records.get(session_id)
+        if record is not None and record["tenant"] == tenant:
             raise SessionConflict(
                 "upload session already completed: %s" % (session_id,))
         session = self._uploads.get(session_id)
-        if session is None:
+        if session is None or session["tenant"] != tenant:
+            # Sessions of other tenants are indistinguishable from unknown
+            # ones: no state or progress leaks across tenant boundaries.
             raise ObjectStoreError("unknown upload session: %r" % (session_id,))
         return session
 
     def begin_upload(self, key, size, sha256, content_type=None,
-                     expected_sha256=_MISSING):
+                     expected_sha256=_MISSING, tenant=DEFAULT_TENANT):
         """Start a resumable upload session and return its unique id.
 
         The key and content type follow the same rules as :meth:`put`, *size*
         must be a non-negative integer (booleans excluded) and *sha256* the
         64 lowercase hex digits of the full content's digest. Creating a
         session changes no object; the session and its progress survive
-        reopening the data directory.
+        reopening the data directory. The session belongs to *tenant* for its
+        whole lifetime: every later operation must name the same tenant.
 
         *expected_sha256* saves the same kind of precondition as :meth:`put`;
         it is checked once, atomically with the publish, when the session
         completes, never while the session is created or appended to.
         """
+        self._check_tenant(tenant)
         self._check_key(key)
         if isinstance(size, bool) or not isinstance(size, int) or size < 0:
             raise ObjectStoreError("invalid size: %r" % (size,))
@@ -500,7 +570,7 @@ class ContentAddressedStore:
         expected = self._check_precondition(expected_sha256)
         session = {"key": key, "size": size, "sha256": sha256,
                    "content_type": content_type, "offset": 0,
-                   "expected_sha256": expected}
+                   "expected_sha256": expected, "tenant": tenant}
         with self._lock:
             session_id = self._new_session_id()
             try:
@@ -517,26 +587,35 @@ class ContentAddressedStore:
             self._uploads[session_id] = session
             return session_id
 
-    def upload_status(self, session_id):
-        """Return the declaration, received ``offset`` and ``completed`` flag."""
+    def upload_status(self, session_id, tenant=DEFAULT_TENANT):
+        """Return the declaration, received ``offset`` and ``completed`` flag.
+
+        Only the session's owning tenant sees it; every other tenant gets
+        the same ``unknown upload session`` error as for a session that
+        never existed.
+        """
+        self._check_tenant(tenant)
         self._check_session_id(session_id)
         with self._lock:
             record = self._upload_records.get(session_id)
             if record is not None:
+                if record["tenant"] != tenant:
+                    raise ObjectStoreError(
+                        "unknown upload session: %r" % (session_id,))
                 entry = record["entry"]
                 return {"key": record["key"], "size": entry["size"],
                         "sha256": entry["sha256"],
                         "content_type": entry["content_type"],
                         "offset": entry["size"], "completed": True}
             session = self._uploads.get(session_id)
-            if session is None:
+            if session is None or session["tenant"] != tenant:
                 raise ObjectStoreError("unknown upload session: %r" % (session_id,))
             return {"key": session["key"], "size": session["size"],
                     "sha256": session["sha256"],
                     "content_type": session["content_type"],
                     "offset": session["offset"], "completed": False}
 
-    def append_upload(self, session_id, offset, payload):
+    def append_upload(self, session_id, offset, payload, tenant=DEFAULT_TENANT):
         """Append one chunk to *session_id* and return the received length.
 
         A new chunk must start exactly at the current end and may not exceed
@@ -545,6 +624,7 @@ class ContentAddressedStore:
         is stored, and fails otherwise; chunks overlapping the end, chunks
         past the end and empty chunks anywhere but at the end all fail.
         """
+        self._check_tenant(tenant)
         self._check_session_id(session_id)
         if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
             raise ObjectStoreError("invalid offset: %r" % (offset,))
@@ -552,7 +632,7 @@ class ContentAddressedStore:
             raise ObjectStoreError("payload must be bytes")
         data = bytes(payload)
         with self._lock:
-            session = self._require_active_session(session_id)
+            session = self._require_active_session(session_id, tenant)
             current = session["offset"]
             if offset > current:
                 raise SessionConflict(
@@ -575,26 +655,31 @@ class ContentAddressedStore:
             session["offset"] = end
             return end
 
-    def complete_upload(self, session_id):
+    def complete_upload(self, session_id, tenant=DEFAULT_TENANT):
         """Publish the object once the received content matches the declaration.
 
         The total length and the SHA-256 of the full content must match the
         declared values (zero-byte objects included); only then is the
-        session's saved precondition checked against the object state at
-        publish time and the object published, all as one indivisible step.
-        A failed precondition raises without changing the object, the
-        session's confirmed bytes or any blob, so the session can be
-        completed again (or aborted) later. Repeating a completed call
-        returns the first result without touching the key again, so later
-        writes or deletes of the key are never overwritten.
+        session's saved precondition checked against the owning tenant's
+        object state at publish time and the object published in that
+        tenant, all as one indivisible step. A failed precondition raises
+        without changing the object, the session's confirmed bytes or any
+        blob, so the session can be completed again (or aborted) later.
+        Repeating a completed call returns the first result without touching
+        the key again, so later writes or deletes of the key are never
+        overwritten.
         """
+        self._check_tenant(tenant)
         self._check_session_id(session_id)
         with self._lock:
             record = self._upload_records.get(session_id)
             if record is not None:
+                if record["tenant"] != tenant:
+                    raise ObjectStoreError(
+                        "unknown upload session: %r" % (session_id,))
                 return dict(record["entry"])
             session = self._uploads.get(session_id)
-            if session is None:
+            if session is None or session["tenant"] != tenant:
                 raise ObjectStoreError("unknown upload session: %r" % (session_id,))
             if session["offset"] != session["size"]:
                 raise SessionConflict(
@@ -607,35 +692,40 @@ class ContentAddressedStore:
                 raise SessionConflict("upload hash mismatch")
             expected = session.get("expected_sha256", _MISSING)
             if expected is not _MISSING and not self._precondition_met(
-                    session["key"], expected):
+                    tenant, session["key"], expected):
                 raise ObjectStoreError("precondition failed")
             entry = {"sha256": session["sha256"], "size": session["size"],
                      "content_type": session["content_type"]}
             self._store_blob(session["sha256"], data)
-            previous = self._index["objects"].get(session["key"], _MISSING)
-            self._index["objects"][session["key"]] = entry
+            objects = self._objects.setdefault(tenant, {})
+            previous = objects.get(session["key"], _MISSING)
+            objects[session["key"]] = entry
             self._upload_records[session_id] = {
-                "key": session["key"], "entry": dict(entry),
+                "key": session["key"], "entry": dict(entry), "tenant": tenant,
             }
             try:
                 self._save_index()
             except OSError:
                 del self._upload_records[session_id]
                 if previous is _MISSING:
-                    del self._index["objects"][session["key"]]
+                    del objects[session["key"]]
                 else:
-                    self._index["objects"][session["key"]] = previous
+                    objects[session["key"]] = previous
                 raise ObjectStoreError("upload io error")
             del self._uploads[session_id]
             self._discard_session_files(session_id)
             return dict(entry)
 
-    def abort_upload(self, session_id):
+    def abort_upload(self, session_id, tenant=DEFAULT_TENANT):
         """Drop *session_id* and return None; published objects are kept."""
+        self._check_tenant(tenant)
         self._check_session_id(session_id)
         with self._lock:
             record = self._upload_records.get(session_id)
             if record is not None:
+                if record["tenant"] != tenant:
+                    raise ObjectStoreError(
+                        "unknown upload session: %r" % (session_id,))
                 del self._upload_records[session_id]
                 try:
                     self._save_index()
@@ -645,7 +735,7 @@ class ContentAddressedStore:
                 self._discard_session_files(session_id)
                 return None
             session = self._uploads.get(session_id)
-            if session is None:
+            if session is None or session["tenant"] != tenant:
                 raise ObjectStoreError("unknown upload session: %r" % (session_id,))
             self._remove_session_files(session_id)
             del self._uploads[session_id]
@@ -662,17 +752,19 @@ class ContentAddressedStore:
         digits are eligible: subdirectories, symlinks, temporary files and any
         other names are left untouched, and symlink targets are never opened.
 
-        References are recomputed from the current object index on every call,
-        including digest sharing between keys. The whole operation runs under
-        the store lock, so blobs published concurrently stay referenced and
-        candidates that vanished between the scan and deletion are skipped
-        rather than counted.
+        References are recomputed from the current object index on every
+        call, across every tenant and including digest sharing between keys.
+        The whole operation runs under the store lock, so blobs published
+        concurrently stay referenced and candidates that vanished between
+        the scan and deletion are skipped rather than counted.
         """
         if not isinstance(dry_run, bool):
             raise ObjectStoreError("invalid dry_run")
         with self._lock:
             referenced = {
-                entry["sha256"] for entry in self._index["objects"].values()
+                entry["sha256"]
+                for objects in self._objects.values()
+                for entry in objects.values()
             }
             try:
                 names = os.listdir(self.blobs_dir)
@@ -713,15 +805,22 @@ class ContentAddressedStore:
                 freed += size
             return {"digests": deleted, "bytes": freed, "dry_run": False}
 
-    def list_objects(self, prefix="", after=None, limit=DEFAULT_LIMIT):
-        """Return ``{"items": [...], "next_after": <str|null>}`` for one page."""
+    def list_objects(self, prefix="", after=None, limit=DEFAULT_LIMIT,
+                     tenant=DEFAULT_TENANT):
+        """Return ``{"items": [...], "next_after": <str|null>}`` for one page.
+
+        Only *tenant*'s objects are filtered, paginated and returned, with
+        the plain object keys as names; a tenant without objects yields an
+        empty page.
+        """
+        self._check_tenant(tenant)
         if not isinstance(prefix, str):
             raise ObjectStoreError("invalid prefix: %r" % (prefix,))
         if after is not None and not isinstance(after, str):
             raise ObjectStoreError("invalid after: %r" % (after,))
         limit = self._check_limit(limit)
         with self._lock:
-            objects = self._index["objects"]
+            objects = self._objects.get(tenant, {})
             keys = sorted(key for key in objects if key.startswith(prefix))
             if after:
                 keys = [key for key in keys if key > after]
