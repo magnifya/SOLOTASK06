@@ -34,6 +34,15 @@ if the session did not exist. Completing a session publishes the object in
 the session's tenant and records the result in the index's ``uploads`` map in
 one atomic index rewrite, so the completion flag can never disagree with the
 published object.
+
+Each tenant may carry a quota policy (``max_bytes`` and/or ``max_objects``,
+persisted in the index's ``quotas`` map) bounding the logical usage of that
+tenant: every object and every retained version counts once towards it, with
+the current pointer never double-counted, and active upload sessions
+additionally reserve their declared size until they complete or abort.
+Writes that would exceed a configured limit are rejected with
+``quota exceeded`` before any data lands; without a policy the tenant is
+unlimited and behaviour is unchanged.
 """
 
 from __future__ import annotations
@@ -111,13 +120,13 @@ class ContentAddressedStore:
         self._lock = threading.RLock()
         os.makedirs(self.blobs_dir, exist_ok=True)
         (self._objects, self._upload_records, self._versioning,
-         self._versions, self._retention) = self._load_index()
+         self._versions, self._retention, self._quotas) = self._load_index()
         self._uploads = self._load_uploads()
 
     # -- index ---------------------------------------------------------
     def _load_index(self):
         if not os.path.exists(self.index_path):
-            return {DEFAULT_TENANT: {}}, {}, {}, {}, {}
+            return {DEFAULT_TENANT: {}}, {}, {}, {}, {}, {}
         try:
             with open(self.index_path, "rb") as handle:
                 document = json.loads(handle.read().decode("utf-8"))
@@ -196,7 +205,15 @@ class ContentAddressedStore:
             if not isinstance(tenant, str) or _TENANT_RE.match(tenant) is None:
                 raise ObjectStoreError("corrupted index: bad retention tenant")
             retention[tenant] = self._validate_policy(policy)
-        return objects, records, versioning, versions, retention
+        quotas = {}
+        raw_quotas = document.get("quotas", {})
+        if not isinstance(raw_quotas, dict):
+            raise ObjectStoreError("corrupted index: quotas is not a map")
+        for tenant, policy in raw_quotas.items():
+            if not isinstance(tenant, str) or _TENANT_RE.match(tenant) is None:
+                raise ObjectStoreError("corrupted index: bad quota tenant")
+            quotas[tenant] = self._validate_quota(policy)
+        return objects, records, versioning, versions, retention, quotas
 
     def _load_object_map(self, mapping):
         objects = {}
@@ -250,6 +267,21 @@ class ContentAddressedStore:
             raise ObjectStoreError("corrupted index: bad retention policy")
         return loaded
 
+    @staticmethod
+    def _validate_quota(policy):
+        if not isinstance(policy, dict):
+            raise ObjectStoreError("corrupted index: bad quota policy")
+        loaded = {}
+        for name, value in policy.items():
+            if name not in ("max_bytes", "max_objects"):
+                raise ObjectStoreError("corrupted index: bad quota policy")
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ObjectStoreError("corrupted index: bad quota policy")
+            loaded[name] = value
+        if not loaded:
+            raise ObjectStoreError("corrupted index: bad quota policy")
+        return loaded
+
     def _save_index(self):
         document = {"version": INDEX_VERSION,
                     "objects": self._objects.get(DEFAULT_TENANT, {})}
@@ -278,6 +310,8 @@ class ContentAddressedStore:
             document["versions"] = versions
         if self._retention:
             document["retention"] = self._retention
+        if self._quotas:
+            document["quotas"] = self._quotas
         payload = json.dumps(document, sort_keys=True, separators=(",", ":"))
         _atomic_write(self.index_path, payload.encode("utf-8") + b"\n")
 
@@ -364,6 +398,7 @@ class ContentAddressedStore:
             if expected is not _MISSING and not self._precondition_met(
                     tenant, key, expected):
                 raise ObjectStoreError("precondition failed")
+            self._check_quota_publish(tenant, key, len(data))
             self._store_blob(sha, data)
             self._objects.setdefault(tenant, {})[key] = entry
             version_id = None
@@ -728,6 +763,12 @@ class ContentAddressedStore:
                    "content_type": content_type, "offset": 0,
                    "expected_sha256": expected, "tenant": tenant}
         with self._lock:
+            policy = self._quotas.get(tenant)
+            if policy is not None and policy.get("max_bytes") is not None:
+                used_bytes, _ = self._usage_locked(tenant)
+                reserved_bytes, _ = self._reserved_locked(tenant)
+                if used_bytes + reserved_bytes + size > policy["max_bytes"]:
+                    raise ObjectStoreError("quota exceeded")
             session_id = self._new_session_id()
             try:
                 os.makedirs(self.uploads_dir, exist_ok=True)
@@ -853,6 +894,10 @@ class ContentAddressedStore:
             if expected is not _MISSING and not self._precondition_met(
                     tenant, session["key"], expected):
                 raise ObjectStoreError("precondition failed")
+            # The session's own reservation is released before the check so
+            # its declared bytes are not counted against it a second time.
+            self._check_quota_publish(tenant, session["key"], session["size"],
+                                      reserved_exclude=session["size"])
             entry = {"sha256": session["sha256"], "size": session["size"],
                      "content_type": session["content_type"]}
             self._store_blob(session["sha256"], data)
@@ -1288,3 +1333,160 @@ class ContentAddressedStore:
                     self._versions.pop(tenant, None)
                 raise ObjectStoreError("version io error")
             return result
+
+    # -- quotas and usage --------------------------------------------------
+    def set_quota(self, max_bytes=None, max_objects=None, tenant=DEFAULT_TENANT):
+        """Save the quota policy of *tenant*.
+
+        At least one of *max_bytes* and *max_objects* must be given, and
+        each given value must be a non-negative integer (booleans
+        excluded); anything else raises ``ObjectStoreError("invalid
+        quota")``. The policy is persisted with the index and bounds new
+        writes from the moment it is saved; existing usage is never
+        removed retroactively.
+        """
+        self._check_tenant(tenant)
+        for value in (max_bytes, max_objects):
+            if value is not None and (isinstance(value, bool)
+                                      or not isinstance(value, int)
+                                      or value < 0):
+                raise ObjectStoreError("invalid quota")
+        if max_bytes is None and max_objects is None:
+            raise ObjectStoreError("invalid quota")
+        policy = {}
+        if max_bytes is not None:
+            policy["max_bytes"] = max_bytes
+        if max_objects is not None:
+            policy["max_objects"] = max_objects
+        with self._lock:
+            previous = self._quotas.get(tenant, _MISSING)
+            self._quotas[tenant] = policy
+            try:
+                self._save_index()
+            except OSError:
+                if previous is _MISSING:
+                    del self._quotas[tenant]
+                else:
+                    self._quotas[tenant] = previous
+                raise ObjectStoreError("quota io error")
+
+    def get_quota(self, tenant=DEFAULT_TENANT):
+        """Return *tenant*'s quota policy, or None when none is saved.
+
+        A saved policy is returned as a dict with both ``max_bytes`` and
+        ``max_objects`` keys, unset limits reading as None.
+        """
+        self._check_tenant(tenant)
+        with self._lock:
+            policy = self._quotas.get(tenant)
+            if policy is None:
+                return None
+            return {"max_bytes": policy.get("max_bytes"),
+                    "max_objects": policy.get("max_objects")}
+
+    def clear_quota(self, tenant=DEFAULT_TENANT):
+        """Drop *tenant*'s quota policy, restoring unlimited usage."""
+        self._check_tenant(tenant)
+        with self._lock:
+            previous = self._quotas.pop(tenant, None)
+            try:
+                self._save_index()
+            except OSError:
+                if previous is not None:
+                    self._quotas[tenant] = previous
+                raise ObjectStoreError("quota io error")
+
+    def _usage_locked(self, tenant):
+        """Return ``(used_bytes, used_objects)`` of *tenant*'s logical data.
+
+        Every object counts once; where a key has retained versions each
+        version counts once instead and the current pointer is not counted
+        again. Digests shared between keys or tenants are counted per
+        reference, never once physically. Must be called under the lock.
+        """
+        objects = self._objects.get(tenant, {})
+        keymap = self._versions.get(tenant, {})
+        used_bytes = 0
+        used_objects = 0
+        for key, entry in objects.items():
+            versions = keymap.get(key)
+            if versions:
+                used_objects += len(versions)
+                used_bytes += sum(version["size"] for version in versions)
+            else:
+                used_objects += 1
+                used_bytes += entry["size"]
+        for key, versions in keymap.items():
+            if key not in objects:
+                used_objects += len(versions)
+                used_bytes += sum(version["size"] for version in versions)
+        return used_bytes, used_objects
+
+    def _reserved_locked(self, tenant):
+        """Return ``(reserved_bytes, reserved_sessions)`` of *tenant*.
+
+        Every active upload session reserves its declared size until it
+        completes or aborts. Must be called under the lock.
+        """
+        reserved_bytes = 0
+        reserved_sessions = 0
+        for session in self._uploads.values():
+            if session["tenant"] == tenant:
+                reserved_sessions += 1
+                reserved_bytes += session["size"]
+        return reserved_bytes, reserved_sessions
+
+    def get_usage(self, tenant=DEFAULT_TENANT):
+        """Return *tenant*'s current logical usage and reservations.
+
+        The result holds four integers: ``used_bytes`` and ``used_objects``
+        count the tenant's objects and retained versions, while
+        ``reserved_bytes`` and ``reserved_sessions`` count the declared
+        sizes of its active upload sessions.
+        """
+        self._check_tenant(tenant)
+        with self._lock:
+            used_bytes, used_objects = self._usage_locked(tenant)
+            reserved_bytes, reserved_sessions = self._reserved_locked(tenant)
+            return {"used_bytes": used_bytes,
+                    "used_objects": used_objects,
+                    "reserved_bytes": reserved_bytes,
+                    "reserved_sessions": reserved_sessions}
+
+    def _check_quota_publish(self, tenant, key, size, reserved_exclude=0):
+        """Raise ``quota exceeded`` if publishing *key* would break a limit.
+
+        Must be called under the store lock, after any precondition has
+        passed and before any data is written. The key's current
+        contribution (its object, or its retained versions) is replaced by
+        what the write would leave behind: a single object of *size* bytes,
+        or one more version when versioning retains the history. Active
+        upload reservations of the tenant count towards ``max_bytes`` as
+        well; *reserved_exclude* subtracts the calling session's own
+        reservation, which is released by the publish itself.
+        """
+        policy = self._quotas.get(tenant)
+        if policy is None:
+            return
+        used_bytes, used_objects = self._usage_locked(tenant)
+        reserved_bytes, _ = self._reserved_locked(tenant)
+        reserved_bytes -= reserved_exclude
+        versions = self._versions.get(tenant, {}).get(key)
+        if versions:
+            cur_objects = len(versions)
+            cur_bytes = sum(version["size"] for version in versions)
+        else:
+            entry = self._objects.get(tenant, {}).get(key)
+            cur_objects, cur_bytes = (1, entry["size"]) if entry else (0, 0)
+        if versions and self._versioning.get(tenant, False):
+            new_objects, new_bytes = cur_objects + 1, cur_bytes + size
+        else:
+            new_objects, new_bytes = 1, size
+        max_bytes = policy.get("max_bytes")
+        if max_bytes is not None and \
+                used_bytes + reserved_bytes - cur_bytes + new_bytes > max_bytes:
+            raise ObjectStoreError("quota exceeded")
+        max_objects = policy.get("max_objects")
+        if max_objects is not None and \
+                used_objects - cur_objects + new_objects > max_objects:
+            raise ObjectStoreError("quota exceeded")
