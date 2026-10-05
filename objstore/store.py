@@ -44,6 +44,19 @@ sessions reserve their declared size until they complete or abort. Writes
 that would exceed a limit fail with ``ObjectStoreError("quota exceeded")``
 before any data lands; tenants without a saved policy are unlimited and see
 no behaviour change.
+
+Each current object written by a new version of the store (a ``put`` or a
+completed resumable upload) carries a comparable UTC ``last_modified``
+timestamp in the index. Objects in indexes written by older versions have no
+such field and are treated as timeless: they load without error and
+lifecycle expiration always skips them. A tenant may also carry a lifecycle
+policy (``lifecycle`` map in the index) with an optional ``prefix`` (a
+string, empty when omitted) and a required non-negative integer
+``max_age_seconds`` (booleans excluded). Running the policy previews or
+deletes the current objects of that tenant whose keys start with the prefix
+and whose last-modified time is older than the age, using the same current
+version removal and promotion rules as ``delete``; lifecycle only drops
+metadata references, leaving the blob bytes for ``collect_garbage``.
 """
 
 from __future__ import annotations
@@ -120,14 +133,15 @@ class ContentAddressedStore:
         self.index_path = os.path.join(self.root, INDEX_NAME)
         self._lock = threading.RLock()
         os.makedirs(self.blobs_dir, exist_ok=True)
-        (self._objects, self._upload_records, self._versioning,
-         self._versions, self._retention, self._quota) = self._load_index()
+        (self._objects, self._timestamps, self._upload_records,
+         self._versioning, self._versions, self._retention, self._quota,
+         self._lifecycle) = self._load_index()
         self._uploads = self._load_uploads()
 
     # -- index ---------------------------------------------------------
     def _load_index(self):
         if not os.path.exists(self.index_path):
-            return {DEFAULT_TENANT: {}}, {}, {}, {}, {}, {}
+            return {DEFAULT_TENANT: {}}, {}, {}, {}, {}, {}, {}, {}
         try:
             with open(self.index_path, "rb") as handle:
                 document = json.loads(handle.read().decode("utf-8"))
@@ -135,7 +149,12 @@ class ContentAddressedStore:
             raise ObjectStoreError("corrupted index: %s" % (exc,))
         if not isinstance(document, dict) or not isinstance(document.get("objects"), dict):
             raise ObjectStoreError("corrupted index: missing objects map")
-        objects = {DEFAULT_TENANT: self._load_object_map(document["objects"])}
+        objects, timestamps = {DEFAULT_TENANT: {}}, {}
+        default_objects, default_times = self._load_object_map(
+            document["objects"])
+        objects[DEFAULT_TENANT] = default_objects
+        if default_times:
+            timestamps[DEFAULT_TENANT] = default_times
         raw_tenants = document.get("tenants", {})
         if not isinstance(raw_tenants, dict):
             raise ObjectStoreError("corrupted index: tenants is not a map")
@@ -145,7 +164,10 @@ class ContentAddressedStore:
                 raise ObjectStoreError("corrupted index: bad tenant")
             if not isinstance(mapping, dict):
                 raise ObjectStoreError("corrupted index: bad tenant objects")
-            objects[tenant] = self._load_object_map(mapping)
+            tenant_objects, tenant_times = self._load_object_map(mapping)
+            objects[tenant] = tenant_objects
+            if tenant_times:
+                timestamps[tenant] = tenant_times
         records = {}
         raw_records = document.get("uploads", {})
         if not isinstance(raw_records, dict):
@@ -161,7 +183,7 @@ class ContentAddressedStore:
                 raise ObjectStoreError("corrupted index: bad upload record")
             records[session_id] = {
                 "key": key,
-                "entry": self._validate_entry(key, record.get("entry")),
+                "entry": self._validate_entry(key, record.get("entry"))[0],
                 "tenant": tenant,
             }
             version_id = record.get("version_id")
@@ -214,15 +236,26 @@ class ContentAddressedStore:
             if not isinstance(tenant, str) or _TENANT_RE.match(tenant) is None:
                 raise ObjectStoreError("corrupted index: bad quota tenant")
             quota[tenant] = self._validate_quota(policy)
-        return objects, records, versioning, versions, retention, quota
+        lifecycle = {}
+        raw_lifecycle = document.get("lifecycle", {})
+        if not isinstance(raw_lifecycle, dict):
+            raise ObjectStoreError("corrupted index: lifecycle is not a map")
+        for tenant, policy in raw_lifecycle.items():
+            if not isinstance(tenant, str) or _TENANT_RE.match(tenant) is None:
+                raise ObjectStoreError("corrupted index: bad lifecycle tenant")
+            lifecycle[tenant] = self._validate_lifecycle_policy(policy)
+        return (objects, timestamps, records, versioning, versions,
+                retention, quota, lifecycle)
 
     def _load_object_map(self, mapping):
-        objects = {}
+        objects, timestamps = {}, {}
         for key, entry in mapping.items():
             if not isinstance(key, str):
                 raise ObjectStoreError("corrupted index: non-string key")
-            objects[key] = self._validate_entry(key, entry)
-        return objects
+            objects[key], last_modified = self._validate_entry(key, entry)
+            if last_modified is not None:
+                timestamps[key] = last_modified
+        return objects, timestamps
 
     @staticmethod
     def _validate_entry(key, entry):
@@ -236,7 +269,18 @@ class ContentAddressedStore:
             raise ObjectStoreError("corrupted index: bad size for %r" % (key,))
         if content_type is not None and not isinstance(content_type, str):
             raise ObjectStoreError("corrupted index: bad content_type for %r" % (key,))
-        return {"sha256": sha, "size": size, "content_type": content_type}
+        last_modified = entry.get("last_modified")
+        if last_modified is not None:
+            if not isinstance(last_modified, str):
+                raise ObjectStoreError(
+                    "corrupted index: bad last_modified for %r" % (key,))
+            try:
+                datetime.fromisoformat(last_modified)
+            except ValueError:
+                raise ObjectStoreError(
+                    "corrupted index: bad last_modified for %r" % (key,))
+        return ({"sha256": sha, "size": size, "content_type": content_type},
+                last_modified)
 
     def _validate_version(self, key, entry):
         if not isinstance(entry, dict):
@@ -247,7 +291,7 @@ class ContentAddressedStore:
         created_at = entry.get("created_at")
         if not isinstance(created_at, str):
             raise ObjectStoreError("corrupted index: bad created_at for %r" % (key,))
-        base = self._validate_entry(key, entry)
+        base = self._validate_entry(key, entry)[0]
         return {"version_id": version_id, "sha256": base["sha256"],
                 "size": base["size"], "content_type": base["content_type"],
                 "created_at": created_at}
@@ -284,10 +328,38 @@ class ContentAddressedStore:
             raise ObjectStoreError("corrupted index: bad quota policy")
         return loaded
 
+    @staticmethod
+    def _validate_lifecycle_policy(policy):
+        if not isinstance(policy, dict):
+            raise ObjectStoreError("corrupted index: bad lifecycle policy")
+        prefix = policy.get("prefix", "")
+        if not isinstance(prefix, str):
+            raise ObjectStoreError("corrupted index: bad lifecycle policy")
+        max_age = policy.get("max_age_seconds")
+        if isinstance(max_age, bool) or not isinstance(max_age, int) or max_age < 0:
+            raise ObjectStoreError("corrupted index: bad lifecycle policy")
+        return {"prefix": prefix, "max_age_seconds": max_age}
+
+    @staticmethod
+    def _stored_entry(entry, last_modified):
+        """Return the on-disk form of *entry*, adding *last_modified* when set."""
+        saved = dict(entry)
+        if last_modified is not None:
+            saved["last_modified"] = last_modified
+        return saved
+
+    def _persist_object_map(self, tenant, mapping):
+        """Serialize one tenant's object map with its saved timestamps."""
+        timestamps = self._timestamps.get(tenant, {})
+        return {key: self._stored_entry(entry, timestamps.get(key))
+                for key, entry in mapping.items()}
+
     def _save_index(self):
         document = {"version": INDEX_VERSION,
-                    "objects": self._objects.get(DEFAULT_TENANT, {})}
-        tenants = {tenant: mapping for tenant, mapping in self._objects.items()
+                    "objects": self._persist_object_map(
+                        DEFAULT_TENANT, self._objects.get(DEFAULT_TENANT, {}))}
+        tenants = {tenant: self._persist_object_map(tenant, mapping)
+                   for tenant, mapping in self._objects.items()
                    if tenant != DEFAULT_TENANT and mapping}
         if tenants:
             document["tenants"] = tenants
@@ -314,6 +386,8 @@ class ContentAddressedStore:
             document["retention"] = self._retention
         if self._quota:
             document["quota"] = self._quota
+        if self._lifecycle:
+            document["lifecycle"] = self._lifecycle
         payload = json.dumps(document, sort_keys=True, separators=(",", ":"))
         _atomic_write(self.index_path, payload.encode("utf-8") + b"\n")
 
@@ -410,6 +484,8 @@ class ContentAddressedStore:
             self._enforce_quota(tenant, delta_bytes, delta_objects)
             self._store_blob(sha, data)
             self._objects.setdefault(tenant, {})[key] = entry
+            self._timestamps.setdefault(tenant, {})[key] = \
+                datetime.now(timezone.utc).isoformat()
             version_id = None
             if versioning_on:
                 version_id = self._append_version(tenant, key, entry)
@@ -513,20 +589,39 @@ class ContentAddressedStore:
             if expected is not _MISSING and not self._precondition_met(
                     tenant, key, expected):
                 raise ObjectStoreError("precondition failed")
-            versions = self._versions.get(tenant, {}).get(key)
-            if self._versioning.get(tenant, False) and versions:
-                versions.pop()
-                if versions:
-                    promoted = versions[-1]
-                    objects[key] = {"sha256": promoted["sha256"],
-                                    "size": promoted["size"],
-                                    "content_type": promoted["content_type"]}
-                else:
-                    del objects[key]
-                    self._drop_versions_key(tenant, key)
+            self._remove_current_unlocked(tenant, key)
+            self._save_index()
+
+    def _remove_current_unlocked(self, tenant, key):
+        """Remove *key*'s current object the way :meth:`delete` does.
+
+        Versioned tenants pop the current version and promote the newest
+        remaining one; unversioned tenants drop the mapping outright. When a
+        version is promoted its ``created_at`` becomes the key's
+        last-modified time (that content's last write); when the mapping is
+        removed the saved timestamp is dropped with it. Must be called under
+        the store lock with *key* present; returns the removed current entry.
+        """
+        objects = self._objects[tenant]
+        removed = dict(objects[key])
+        versions = self._versions.get(tenant, {}).get(key)
+        if self._versioning.get(tenant, False) and versions:
+            versions.pop()
+            if versions:
+                promoted = versions[-1]
+                objects[key] = {"sha256": promoted["sha256"],
+                                "size": promoted["size"],
+                                "content_type": promoted["content_type"]}
+                self._timestamps.setdefault(tenant, {})[key] = \
+                    promoted["created_at"]
             else:
                 del objects[key]
-            self._save_index()
+                self._timestamps.get(tenant, {}).pop(key, None)
+                self._drop_versions_key(tenant, key)
+        else:
+            del objects[key]
+            self._timestamps.get(tenant, {}).pop(key, None)
+        return removed
 
     def _drop_versions_key(self, tenant, key):
         """Remove *key*'s (empty) version list and prune empty parent maps."""
@@ -918,8 +1013,12 @@ class ContentAddressedStore:
                                 release_session=session)
             self._store_blob(session["sha256"], data)
             objects = self._objects.setdefault(tenant, {})
+            timestamps = self._timestamps.setdefault(tenant, {})
             previous = objects.get(session["key"], _MISSING)
+            previous_time = timestamps.get(session["key"], _MISSING)
+            published_at = datetime.now(timezone.utc).isoformat()
             objects[session["key"]] = entry
+            timestamps[session["key"]] = published_at
             version_id = None
             if versioning_on:
                 version_id = self._append_version(tenant, session["key"], entry)
@@ -939,6 +1038,10 @@ class ContentAddressedStore:
                     del objects[session["key"]]
                 else:
                     objects[session["key"]] = previous
+                if previous_time is _MISSING:
+                    timestamps.pop(session["key"], None)
+                else:
+                    timestamps[session["key"]] = previous_time
                 raise ObjectStoreError("upload io error")
             del self._uploads[session_id]
             self._discard_session_files(session_id)
@@ -1223,8 +1326,11 @@ class ContentAddressedStore:
                     objects[key] = {"sha256": promoted["sha256"],
                                     "size": promoted["size"],
                                     "content_type": promoted["content_type"]}
+                    self._timestamps.setdefault(tenant, {})[key] = \
+                        promoted["created_at"]
             else:
                 objects.pop(key, None)
+                self._timestamps.get(tenant, {}).pop(key, None)
                 self._drop_versions_key(tenant, key)
             self._save_index()
 
@@ -1527,3 +1633,147 @@ class ContentAddressedStore:
         self._check_tenant(tenant)
         with self._lock:
             return self._usage_unlocked(tenant)
+
+    # -- lifecycle -------------------------------------------------------
+    def set_lifecycle(self, max_age_seconds, prefix="", tenant=DEFAULT_TENANT):
+        """Save *tenant*'s lifecycle expiration policy.
+
+        *prefix* must be a string (empty when omitted) and
+        *max_age_seconds* a required non-negative integer (booleans
+        excluded); a missing age or any other value raises
+        ``ObjectStoreError("invalid lifecycle")``. The policy only takes
+        effect through :meth:`run_lifecycle` and is persisted atomically
+        with the index, an I/O failure raising
+        ``ObjectStoreError("lifecycle io error")`` and keeping the previous
+        policy.
+        """
+        self._check_tenant(tenant)
+        policy = self._check_lifecycle_values(prefix, max_age_seconds)
+        with self._lock:
+            previous = self._lifecycle.get(tenant)
+            self._lifecycle[tenant] = policy
+            try:
+                self._save_index()
+            except OSError:
+                if previous is None:
+                    del self._lifecycle[tenant]
+                else:
+                    self._lifecycle[tenant] = previous
+                raise ObjectStoreError("lifecycle io error")
+
+    @staticmethod
+    def _check_lifecycle_values(prefix, max_age_seconds):
+        if not isinstance(prefix, str):
+            raise ObjectStoreError("invalid lifecycle")
+        if isinstance(max_age_seconds, bool) \
+                or not isinstance(max_age_seconds, int) \
+                or max_age_seconds < 0:
+            raise ObjectStoreError("invalid lifecycle")
+        return {"prefix": prefix, "max_age_seconds": max_age_seconds}
+
+    def get_lifecycle(self, tenant=DEFAULT_TENANT):
+        """Return *tenant*'s lifecycle policy, or None when none is saved."""
+        self._check_tenant(tenant)
+        with self._lock:
+            policy = self._lifecycle.get(tenant)
+            if policy is None:
+                return None
+            return {"prefix": policy["prefix"],
+                    "max_age_seconds": policy["max_age_seconds"]}
+
+    def clear_lifecycle(self, tenant=DEFAULT_TENANT):
+        """Drop *tenant*'s lifecycle policy and return None.
+
+        Clearing a tenant without a policy is a no-op. An I/O failure while
+        saving raises ``ObjectStoreError("lifecycle io error")`` and keeps
+        the previous policy.
+        """
+        self._check_tenant(tenant)
+        with self._lock:
+            previous = self._lifecycle.pop(tenant, None)
+            try:
+                self._save_index()
+            except OSError:
+                if previous is not None:
+                    self._lifecycle[tenant] = previous
+                raise ObjectStoreError("lifecycle io error")
+
+    @staticmethod
+    def _parse_timestamp(value):
+        """Parse an ISO UTC timestamp; a naive value is assumed to be UTC."""
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed
+
+    def run_lifecycle(self, dry_run=True, tenant=DEFAULT_TENANT):
+        """Preview or delete *tenant*'s expired current objects.
+
+        Returns ``{"objects": [...], "bytes": <int>, "dry_run": <bool>}``.
+        The cutoff is the current UTC time minus the policy's
+        ``max_age_seconds``; only the tenant's current objects whose keys
+        start with the policy ``prefix`` and whose last-modified time is
+        older than the cutoff are candidates, sorted by key. Objects whose
+        index entry has no last-modified time (objects first written by an
+        older version) are timeless and always skipped. Each result entry
+        holds ``key``, ``sha256`` and ``size`` and bytes is the sum of
+        their sizes. Without a saved policy the result is empty. A dry run
+        (the default) changes nothing; an actual run performs every removal
+        under the store lock in one atomic index rewrite, following
+        :meth:`delete`'s current-version removal and old-version promotion
+        rules for versioned tenants and simply dropping the mapping for
+        unversioned ones. Active upload sessions are never touched, and
+        only metadata references are removed: the blob bytes stay for
+        :meth:`collect_garbage`. An I/O failure restores every object map,
+        version list and (derived) quota counter and raises
+        ``ObjectStoreError("lifecycle io error")``.
+        """
+        self._check_tenant(tenant)
+        if not isinstance(dry_run, bool):
+            raise ObjectStoreError("invalid dry_run")
+        with self._lock:
+            policy = self._lifecycle.get(tenant)
+            if policy is None:
+                return {"objects": [], "bytes": 0, "dry_run": dry_run}
+            prefix = policy["prefix"]
+            cutoff = datetime.now(timezone.utc) - timedelta(
+                seconds=policy["max_age_seconds"])
+            objects = self._objects.get(tenant, {})
+            timestamps = self._timestamps.get(tenant, {})
+            candidates = []
+            for key in sorted(objects):
+                if not key.startswith(prefix):
+                    continue
+                last_modified = timestamps.get(key)
+                if last_modified is None:
+                    continue
+                if self._parse_timestamp(last_modified) < cutoff:
+                    entry = objects[key]
+                    candidates.append({
+                        "key": key,
+                        "sha256": entry["sha256"],
+                        "size": entry["size"],
+                    })
+            result = {"objects": candidates,
+                      "bytes": sum(item["size"] for item in candidates),
+                      "dry_run": dry_run}
+            if dry_run or not candidates:
+                return result
+            saved_objects = {name: dict(mapping)
+                             for name, mapping in self._objects.items()}
+            saved_timestamps = {name: dict(mapping)
+                                for name, mapping in self._timestamps.items()}
+            saved_versions = {
+                name: {key: list(versions)
+                       for key, versions in keymap.items()}
+                for name, keymap in self._versions.items()}
+            try:
+                for item in candidates:
+                    self._remove_current_unlocked(tenant, item["key"])
+                self._save_index()
+            except OSError:
+                self._objects = saved_objects
+                self._timestamps = saved_timestamps
+                self._versions = saved_versions
+                raise ObjectStoreError("lifecycle io error")
+            return result
