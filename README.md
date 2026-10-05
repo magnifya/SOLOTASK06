@@ -14,8 +14,8 @@ resumable uploads, object versioning and retention, lifecycle and garbage
 collection, metadata indexing and listing, quotas and rate limiting, consistent
 hashing and rebalancing, erasure coding and repair, signed URLs and access
 control, cross-region replication and end-to-end audit. Multi-tenant namespaces,
-conditional writes, resumable uploads, object versioning with retention and
-per-tenant quotas are already implemented.
+conditional writes, resumable uploads, object versioning with retention,
+per-tenant quotas and lifecycle policies are already implemented.
 
 ## Requirements
 
@@ -344,6 +344,49 @@ limits read as `null`), and `GET /v1/usage` returns the four counters
 exactly like `get_usage`. The command line interface is unchanged by this
 feature.
 
+### Lifecycle policies
+
+Each tenant may carry a lifecycle policy with an optional key `prefix`
+(default `""`, matching every key) and a required `max_age_seconds` — a
+missing age, a non-string prefix, booleans, negatives or other types raise
+`ObjectStoreError("invalid lifecycle")` / return
+`400 {"error":"invalid lifecycle"}`:
+
+```python
+store.set_lifecycle(prefix="logs/", max_age_seconds=86400, tenant="acme")
+store.get_lifecycle(tenant="acme")   # -> {"prefix":..., "max_age_seconds":...} or None
+store.clear_lifecycle(tenant="acme")
+store.run_lifecycle(dry_run=True, tenant="acme")
+# -> {"objects": [{"key","sha256","size"}, ...], "bytes": <int>, "dry_run": <bool>}
+```
+
+Every `put` and every completed resumable upload stamps the stored entry
+with a comparable UTC `last_write` time; objects written before this field
+existed have none and lifecycle runs skip them forever (old data
+directories reopen without error). `run_lifecycle` computes its cutoff
+from the current UTC time and reports — sorted by key — the objects whose
+key matches the prefix and whose last-write time is earlier than the
+cutoff. A dry run (the default) changes nothing; an actual run removes
+each candidate under the store lock exactly like `delete` (a versioned key
+loses only its current version and promotes the newest remaining one, an
+unversioned key loses its mapping), while active upload sessions are never
+touched. Only metadata references are removed: the blob bytes stay on disk
+until `collect_garbage` reclaims them. Without a saved policy the result
+is empty. A non-boolean `dry_run` raises `ObjectStoreError("invalid
+dry_run")`, and an I/O failure while saving raises
+`ObjectStoreError("lifecycle io error")` (HTTP `500`) with the object
+mappings, versions and quotas left exactly as they were. The policy and
+the timestamps persist with the atomic index and survive crashes.
+
+The HTTP surface grows two tenant-scoped endpoints (tenant selected
+through `X-Objstore-Tenant` as usual): `GET`/`PUT`/`DELETE /v1/lifecycle`
+reads (no policy reads as `null`), saves and clears the policy as
+`{"prefix":..., "max_age_seconds":...}` (unknown body fields return
+`400 {"error":"invalid json..."}`), and `POST /v1/lifecycle/run` runs the
+policy with no body or an optional `{"dry_run": <bool>}` body (default
+`true`, any other field rejected as invalid json). The command line
+interface is unchanged by this feature.
+
 
 
 ## Tests
@@ -416,6 +459,10 @@ checks.
 | PUT | `/v1/quota` | 200 with the saved policy; body holds at least one of the two non-negative integer limits and no unknown fields | 400 invalid json / invalid quota, 405, 411, 500 quota io error |
 | DELETE | `/v1/quota` | 200 `{"max_bytes": null, "max_objects": null}`; clears the policy | 400 invalid tenant, 405, 500 quota io error |
 | GET | `/v1/usage` | 200 `{"used_bytes","used_objects","reserved_bytes","reserved_sessions"}` for the selected tenant | 400 invalid tenant, 405 |
+| GET | `/v1/lifecycle` | 200 `{"prefix": <str>, "max_age_seconds": <int>}` for the selected tenant, or `null` when no policy is saved | 400 invalid tenant, 405 |
+| PUT | `/v1/lifecycle` | 200 with the saved policy; body holds an optional `prefix` string and a required non-negative integer `max_age_seconds`, no unknown fields | 400 invalid json / invalid lifecycle, 405, 411, 500 lifecycle io error |
+| DELETE | `/v1/lifecycle` | 200 `null`; clears the policy | 400 invalid tenant, 405, 500 lifecycle io error |
+| POST | `/v1/lifecycle/run` | 200 `{"objects":[{"key","sha256","size"}],"bytes":<int>,"dry_run":<bool>}`; no body or an optional `{"dry_run": <bool>}` body (default `true`) | 400 invalid json / invalid dry_run, 405, 500 lifecycle io error |
 
 Notes:
 
@@ -489,15 +536,17 @@ completion records without a `tenant` field. Indexes written before
 versioning existed have no `versioning`, `versions` or `retention` maps, so
 every tenant starts with versioning disabled and no key gains versions it
 never wrote. Indexes written before quotas existed have no `quota` map, so
-every tenant starts unlimited.
+every tenant starts unlimited. Indexes written before lifecycle policies
+existed have no `lifecycle` map and no `last_write` fields on their object
+entries, so every tenant starts without a policy and those older objects
+are never lifecycle candidates.
 
 ## Limits of this seed
 
 The following long-term goals are intentionally not implemented yet:
-lifecycle policies on top of the existing garbage collection of unreferenced
-blobs, rate limiting, consistent hashing and rebalancing, erasure
+rate limiting, consistent hashing and rebalancing, erasure
 coding and repair, signed URLs and access control, cross-region replication
 and end-to-end audit logging. Resumable uploads are exposed through the
 Python API and the HTTP surface; the command line interface does not expose
-them yet, and likewise exposes no versioning, retention or quota commands.
-Authentication is out of scope: the server trusts every caller.
+them yet, and likewise exposes no versioning, retention, quota or lifecycle
+commands. Authentication is out of scope: the server trusts every caller.

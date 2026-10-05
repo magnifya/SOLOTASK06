@@ -44,6 +44,18 @@ sessions reserve their declared size until they complete or abort. Writes
 that would exceed a limit fail with ``ObjectStoreError("quota exceeded")``
 before any data lands; tenants without a saved policy are unlimited and see
 no behaviour change.
+
+Each tenant may also carry a lifecycle policy (``lifecycle`` map in the
+index) with an optional key ``prefix`` and a required ``max_age_seconds``.
+Every ``put`` and every completed resumable upload stamps the stored entry
+with a comparable UTC ``last_write`` time; entries written by older versions
+have none and lifecycle runs skip them forever. ``run_lifecycle`` previews
+by default and otherwise deletes every object whose key matches the prefix
+and whose last-write time is older than the policy horizon, following the
+same current-version removal and promotion rules as ``delete``. Only
+metadata references are removed; the blob bytes stay on disk for garbage
+collection. Indexes written before lifecycle policies existed have no
+``lifecycle`` map and no ``last_write`` fields, and reopen without error.
 """
 
 from __future__ import annotations
@@ -121,13 +133,14 @@ class ContentAddressedStore:
         self._lock = threading.RLock()
         os.makedirs(self.blobs_dir, exist_ok=True)
         (self._objects, self._upload_records, self._versioning,
-         self._versions, self._retention, self._quota) = self._load_index()
+         self._versions, self._retention, self._quota,
+         self._lifecycle) = self._load_index()
         self._uploads = self._load_uploads()
 
     # -- index ---------------------------------------------------------
     def _load_index(self):
         if not os.path.exists(self.index_path):
-            return {DEFAULT_TENANT: {}}, {}, {}, {}, {}, {}
+            return {DEFAULT_TENANT: {}}, {}, {}, {}, {}, {}, {}
         try:
             with open(self.index_path, "rb") as handle:
                 document = json.loads(handle.read().decode("utf-8"))
@@ -214,7 +227,15 @@ class ContentAddressedStore:
             if not isinstance(tenant, str) or _TENANT_RE.match(tenant) is None:
                 raise ObjectStoreError("corrupted index: bad quota tenant")
             quota[tenant] = self._validate_quota(policy)
-        return objects, records, versioning, versions, retention, quota
+        lifecycle = {}
+        raw_lifecycle = document.get("lifecycle", {})
+        if not isinstance(raw_lifecycle, dict):
+            raise ObjectStoreError("corrupted index: lifecycle is not a map")
+        for tenant, policy in raw_lifecycle.items():
+            if not isinstance(tenant, str) or _TENANT_RE.match(tenant) is None:
+                raise ObjectStoreError("corrupted index: bad lifecycle tenant")
+            lifecycle[tenant] = self._validate_lifecycle(policy)
+        return objects, records, versioning, versions, retention, quota, lifecycle
 
     def _load_object_map(self, mapping):
         objects = {}
@@ -236,7 +257,16 @@ class ContentAddressedStore:
             raise ObjectStoreError("corrupted index: bad size for %r" % (key,))
         if content_type is not None and not isinstance(content_type, str):
             raise ObjectStoreError("corrupted index: bad content_type for %r" % (key,))
-        return {"sha256": sha, "size": size, "content_type": content_type}
+        # Entries written before lifecycle policies existed carry no
+        # last-write time; they load as "timeless" and lifecycle runs skip
+        # them forever. A present value must be a comparable UTC string.
+        last_write = entry.get("last_write")
+        if last_write is not None and not isinstance(last_write, str):
+            raise ObjectStoreError("corrupted index: bad last_write for %r" % (key,))
+        loaded = {"sha256": sha, "size": size, "content_type": content_type}
+        if last_write is not None:
+            loaded["last_write"] = last_write
+        return loaded
 
     def _validate_version(self, key, entry):
         if not isinstance(entry, dict):
@@ -284,6 +314,17 @@ class ContentAddressedStore:
             raise ObjectStoreError("corrupted index: bad quota policy")
         return loaded
 
+    @staticmethod
+    def _validate_lifecycle(policy):
+        if not isinstance(policy, dict):
+            raise ObjectStoreError("corrupted index: bad lifecycle policy")
+        prefix = policy.get("prefix", "")
+        max_age = policy.get("max_age_seconds")
+        if not isinstance(prefix, str) or isinstance(max_age, bool) \
+                or not isinstance(max_age, int) or max_age < 0:
+            raise ObjectStoreError("corrupted index: bad lifecycle policy")
+        return {"prefix": prefix, "max_age_seconds": max_age}
+
     def _save_index(self):
         document = {"version": INDEX_VERSION,
                     "objects": self._objects.get(DEFAULT_TENANT, {})}
@@ -314,10 +355,23 @@ class ContentAddressedStore:
             document["retention"] = self._retention
         if self._quota:
             document["quota"] = self._quota
+        if self._lifecycle:
+            document["lifecycle"] = self._lifecycle
         payload = json.dumps(document, sort_keys=True, separators=(",", ":"))
         _atomic_write(self.index_path, payload.encode("utf-8") + b"\n")
 
     # -- validation ----------------------------------------------------
+    @staticmethod
+    def _public_entry(entry):
+        """Return the caller-facing view of a stored entry.
+
+        The stored entry may carry internal bookkeeping such as the
+        ``last_write`` timestamp used by lifecycle policies; callers keep
+        the historical ``sha256``/``size``/``content_type`` shape.
+        """
+        return {"sha256": entry["sha256"], "size": entry["size"],
+                "content_type": entry["content_type"]}
+
     @staticmethod
     def _check_tenant(tenant):
         if not isinstance(tenant, str) or _TENANT_RE.match(tenant) is None:
@@ -399,7 +453,8 @@ class ContentAddressedStore:
         expected = self._check_precondition(expected_sha256)
         data = bytes(payload)
         sha = hashlib.sha256(data).hexdigest()
-        entry = {"sha256": sha, "size": len(data), "content_type": content_type}
+        entry = {"sha256": sha, "size": len(data), "content_type": content_type,
+                 "last_write": datetime.now(timezone.utc).isoformat()}
         with self._lock:
             if expected is not _MISSING and not self._precondition_met(
                     tenant, key, expected):
@@ -414,7 +469,7 @@ class ContentAddressedStore:
             if versioning_on:
                 version_id = self._append_version(tenant, key, entry)
             self._save_index()
-            result = dict(entry)
+            result = self._public_entry(entry)
             if version_id is not None:
                 result["version_id"] = version_id
             return result
@@ -488,7 +543,7 @@ class ContentAddressedStore:
             entry = self._objects.get(tenant, {}).get(key)
             if entry is None:
                 raise ObjectStoreError("not found: %s" % (key,))
-            return dict(entry)
+            return self._public_entry(entry)
 
     def delete(self, key, expected_sha256=_MISSING, tenant=DEFAULT_TENANT):
         """Drop *key* in *tenant*; shared blobs stay on disk for other keys.
@@ -887,7 +942,7 @@ class ContentAddressedStore:
                 if record["tenant"] != tenant:
                     raise ObjectStoreError(
                         "unknown upload session: %r" % (session_id,))
-                entry = dict(record["entry"])
+                entry = self._public_entry(record["entry"])
                 if record.get("version_id") is not None:
                     entry["version_id"] = record["version_id"]
                 return entry
@@ -908,7 +963,8 @@ class ContentAddressedStore:
                     tenant, session["key"], expected):
                 raise ObjectStoreError("precondition failed")
             entry = {"sha256": session["sha256"], "size": session["size"],
-                     "content_type": session["content_type"]}
+                     "content_type": session["content_type"],
+                     "last_write": datetime.now(timezone.utc).isoformat()}
             # The session's own reservation is lifted before the quota check:
             # its reserved bytes become the used bytes being published.
             versioning_on = self._versioning.get(tenant, False)
@@ -942,7 +998,7 @@ class ContentAddressedStore:
                 raise ObjectStoreError("upload io error")
             del self._uploads[session_id]
             self._discard_session_files(session_id)
-            result = dict(entry)
+            result = self._public_entry(entry)
             if version_id is not None:
                 result["version_id"] = version_id
             return result
@@ -1348,6 +1404,158 @@ class ContentAddressedStore:
                 else:
                     self._versions.pop(tenant, None)
                 raise ObjectStoreError("version io error")
+            return result
+
+    # -- lifecycle -------------------------------------------------------
+    def set_lifecycle(self, prefix="", max_age_seconds=None,
+                      tenant=DEFAULT_TENANT):
+        """Save the lifecycle policy of *tenant* and return it.
+
+        The policy holds an optional *prefix* (default the empty string,
+        matching every key) and a required *max_age_seconds*. *prefix* must
+        be a string and *max_age_seconds* a non-negative integer (booleans
+        excluded); a missing age or any other invalid value raises
+        ``ObjectStoreError("invalid lifecycle")``. The policy only takes
+        effect through :meth:`run_lifecycle`. An I/O failure while saving
+        raises ``ObjectStoreError("lifecycle io error")`` and keeps the
+        previous policy.
+        """
+        self._check_tenant(tenant)
+        if not isinstance(prefix, str) \
+                or isinstance(max_age_seconds, bool) \
+                or not isinstance(max_age_seconds, int) or max_age_seconds < 0:
+            raise ObjectStoreError("invalid lifecycle")
+        policy = {"prefix": prefix, "max_age_seconds": max_age_seconds}
+        with self._lock:
+            previous = self._lifecycle.get(tenant)
+            self._lifecycle[tenant] = policy
+            try:
+                self._save_index()
+            except OSError:
+                if previous is None:
+                    del self._lifecycle[tenant]
+                else:
+                    self._lifecycle[tenant] = previous
+                raise ObjectStoreError("lifecycle io error")
+            return dict(policy)
+
+    def get_lifecycle(self, tenant=DEFAULT_TENANT):
+        """Return *tenant*'s lifecycle policy, or None when none is saved.
+
+        A saved policy is returned as a dict with ``prefix`` and
+        ``max_age_seconds`` keys.
+        """
+        self._check_tenant(tenant)
+        with self._lock:
+            policy = self._lifecycle.get(tenant)
+            if policy is None:
+                return None
+            return dict(policy)
+
+    def clear_lifecycle(self, tenant=DEFAULT_TENANT):
+        """Drop *tenant*'s lifecycle policy and return None.
+
+        Clearing a tenant without a policy is a no-op. An I/O failure while
+        saving raises ``ObjectStoreError("lifecycle io error")`` and keeps
+        the previous policy.
+        """
+        self._check_tenant(tenant)
+        with self._lock:
+            previous = self._lifecycle.pop(tenant, None)
+            try:
+                self._save_index()
+            except OSError:
+                if previous is not None:
+                    self._lifecycle[tenant] = previous
+                raise ObjectStoreError("lifecycle io error")
+
+    def run_lifecycle(self, dry_run=True, tenant=DEFAULT_TENANT):
+        """Apply *tenant*'s saved lifecycle policy, previewing by default.
+
+        Returns ``{"objects": [...], "bytes": <int>, "dry_run": <bool>}``
+        where the objects are the entries the policy removes (or would
+        remove), sorted by key and each holding ``key``, ``sha256`` and
+        ``size``; bytes is the sum of their sizes. The cutoff is computed
+        from the current UTC time at execution: only objects whose key
+        matches the policy's prefix and whose last-write time is earlier
+        than the cutoff are candidates. Objects written before last-write
+        times existed have no timestamp and are always skipped. Without a
+        saved policy the result is empty.
+
+        A dry run changes nothing. An actual run removes each candidate
+        under the store lock exactly like :meth:`delete`: for a versioned
+        key only the current version is removed and the newest remaining
+        version is promoted, for an unversioned key the current mapping is
+        dropped. Active upload sessions are never touched, and only
+        metadata references are removed — the blob bytes stay on disk for
+        :meth:`collect_garbage`. An I/O failure while saving raises
+        ``ObjectStoreError("lifecycle io error")`` and leaves the object
+        mappings, versions and quotas exactly as they were.
+        """
+        self._check_tenant(tenant)
+        if not isinstance(dry_run, bool):
+            raise ObjectStoreError("invalid dry_run")
+        with self._lock:
+            policy = self._lifecycle.get(tenant)
+            if policy is None:
+                return {"objects": [], "bytes": 0, "dry_run": dry_run}
+            cutoff = datetime.now(timezone.utc) \
+                - timedelta(seconds=policy["max_age_seconds"])
+            prefix = policy["prefix"]
+            objects = self._objects.get(tenant, {})
+            candidates = []
+            for key in sorted(objects):
+                if not key.startswith(prefix):
+                    continue
+                last_write = objects[key].get("last_write")
+                if not isinstance(last_write, str):
+                    continue
+                try:
+                    written = datetime.fromisoformat(last_write)
+                except ValueError:
+                    continue
+                if written < cutoff:
+                    entry = objects[key]
+                    candidates.append({"key": key, "sha256": entry["sha256"],
+                                       "size": entry["size"]})
+            result = {"objects": candidates,
+                      "bytes": sum(item["size"] for item in candidates),
+                      "dry_run": dry_run}
+            if dry_run or not candidates:
+                return result
+            had_objects = tenant in self._objects
+            saved_objects = dict(objects)
+            had_versions = tenant in self._versions
+            saved_versions = {key: list(versions) for key, versions
+                              in self._versions.get(tenant, {}).items()}
+            versioning_on = self._versioning.get(tenant, False)
+            for item in candidates:
+                key = item["key"]
+                versions = self._versions.get(tenant, {}).get(key)
+                if versioning_on and versions:
+                    versions.pop()
+                    if versions:
+                        promoted = versions[-1]
+                        objects[key] = {"sha256": promoted["sha256"],
+                                        "size": promoted["size"],
+                                        "content_type": promoted["content_type"]}
+                    else:
+                        del objects[key]
+                        self._drop_versions_key(tenant, key)
+                else:
+                    objects.pop(key, None)
+            try:
+                self._save_index()
+            except OSError:
+                if had_objects:
+                    self._objects[tenant] = saved_objects
+                else:
+                    self._objects.pop(tenant, None)
+                if had_versions:
+                    self._versions[tenant] = saved_versions
+                else:
+                    self._versions.pop(tenant, None)
+                raise ObjectStoreError("lifecycle io error")
             return result
 
     # -- quota and usage -------------------------------------------------

@@ -9,7 +9,8 @@ optional ``X-Objstore-Tenant`` request header (default ``default``); the blob
 endpoints stay global and ignore it. The versioning and retention endpoints
 (``/v1/versioning``, ``/v1/objects/{key}/versions[...]``, ``/v1/retention``
 and ``/v1/retention/purge``) and the quota endpoints (``/v1/quota`` and
-``/v1/usage``) are tenant-scoped the same way.
+``/v1/usage``) are tenant-scoped the same way, as are the lifecycle
+endpoints (``/v1/lifecycle`` and ``/v1/lifecycle/run``).
 """
 
 from __future__ import annotations
@@ -41,6 +42,8 @@ _RETENTION_PATH = "/v1/retention"
 _RETENTION_PURGE_PATH = "/v1/retention/purge"
 _QUOTA_PATH = "/v1/quota"
 _USAGE_PATH = "/v1/usage"
+_LIFECYCLE_PATH = "/v1/lifecycle"
+_LIFECYCLE_RUN_PATH = "/v1/lifecycle/run"
 _TENANT_HEADER = "X-Objstore-Tenant"
 _DEFAULT_CONTENT_TYPE = "application/octet-stream"
 _DECIMAL_RE = re.compile(r"\A[0-9]+\Z")
@@ -49,10 +52,11 @@ _BAD_REQUEST_PREFIXES = (
     "invalid after", "invalid size", "invalid offset", "invalid json",
     "invalid precondition", "invalid tenant", "invalid version",
     "invalid retention", "invalid dry_run", "invalid quota",
+    "invalid lifecycle",
     "versioning disabled", "payload", "content_type",
 )
 _INTERNAL_ERRORS = ("corrupted blob", "blob io error", "upload io error",
-                    "version io error", "quota io error")
+                    "version io error", "quota io error", "lifecycle io error")
 
 
 def _json_bytes(payload):
@@ -205,6 +209,13 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
                     return self._error(405, "method not allowed")
                 return self._send(200, _json_bytes(
                     self.server.store.get_usage(tenant=tenant)))
+            if path == _LIFECYCLE_PATH:
+                return self._lifecycle(method, self._tenant())
+            if path == _LIFECYCLE_RUN_PATH:
+                tenant = self._tenant()
+                if method != "POST":
+                    return self._error(405, "method not allowed")
+                return self._run_lifecycle(tenant)
             if path.startswith(_OBJECTS_PATH + "/"):
                 return self._object(method, unquote(path[len(_OBJECTS_PATH) + 1:]),
                                     parsed.query)
@@ -550,6 +561,48 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
             return self._send(200, _json_bytes({
                 "max_bytes": None, "max_objects": None}))
         return self._error(405, "method not allowed")
+
+    def _lifecycle(self, method, tenant):
+        store = self.server.store
+        if method == "GET":
+            return self._send(200, _json_bytes(store.get_lifecycle(tenant=tenant)))
+        if method == "PUT":
+            body, error = self._read_length_body()
+            if error is not None:
+                return self._error(*error)
+            document = self._json_object(body)
+            unknown = set(document) - {"prefix", "max_age_seconds"}
+            if unknown:
+                raise ObjectStoreError(
+                    "invalid json: unknown field %r" % (sorted(unknown)[0],))
+            policy = store.set_lifecycle(
+                prefix=document.get("prefix", ""),
+                max_age_seconds=document.get("max_age_seconds"),
+                tenant=tenant)
+            return self._send(200, _json_bytes(policy))
+        if method == "DELETE":
+            store.clear_lifecycle(tenant=tenant)
+            return self._send(200, _json_bytes(None))
+        return self._error(405, "method not allowed")
+
+    def _run_lifecycle(self, tenant):
+        if self.headers.get("Transfer-Encoding") is not None:
+            self.close_connection = True
+            return self._error(400, "transfer encoding not supported")
+        dry_run = True
+        if self.headers.get("Content-Length") is not None:
+            body, error = self._read_length_body()
+            if error is not None:
+                return self._error(*error)
+            if body:
+                document = self._json_object(body)
+                unknown = set(document) - {"dry_run"}
+                if unknown:
+                    raise ObjectStoreError(
+                        "invalid json: unknown field %r" % (sorted(unknown)[0],))
+                dry_run = document.get("dry_run", True)
+        result = self.server.store.run_lifecycle(dry_run=dry_run, tenant=tenant)
+        return self._send(200, _json_bytes(result))
 
     def _blob(self, sha256):
         if _SHA256_RE.match(sha256) is None:
