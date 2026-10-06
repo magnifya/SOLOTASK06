@@ -57,16 +57,28 @@ deletes the current objects of that tenant whose keys start with the prefix
 and whose last-modified time is older than the age, using the same current
 version removal and promotion rules as ``delete``; lifecycle only drops
 metadata references, leaving the blob bytes for ``collect_garbage``.
+
+Each tenant may carry an access policy (``access`` map in the index) of
+either ``public`` — the default, keeping the historical behaviour exactly —
+or ``signed`` with a persisted UTF-8 secret of 16 to 256 characters. While a
+tenant is signed, object and version ``get``/``head`` reads require a future
+integer ``expires`` timestamp and the lowercase hex HMAC-SHA256 of the
+tenant, method, key, optional version id and expiry joined by newlines,
+verified in constant time before the key or version is ever looked up;
+anything else raises ``ObjectStoreError("access denied")``. Indexes written
+by older versions have no ``access`` map, so every tenant starts public.
 """
 
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
 import stat
 import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -135,13 +147,13 @@ class ContentAddressedStore:
         os.makedirs(self.blobs_dir, exist_ok=True)
         (self._objects, self._timestamps, self._upload_records,
          self._versioning, self._versions, self._retention, self._quota,
-         self._lifecycle) = self._load_index()
+         self._lifecycle, self._access) = self._load_index()
         self._uploads = self._load_uploads()
 
     # -- index ---------------------------------------------------------
     def _load_index(self):
         if not os.path.exists(self.index_path):
-            return {DEFAULT_TENANT: {}}, {}, {}, {}, {}, {}, {}, {}
+            return {DEFAULT_TENANT: {}}, {}, {}, {}, {}, {}, {}, {}, {}
         try:
             with open(self.index_path, "rb") as handle:
                 document = json.loads(handle.read().decode("utf-8"))
@@ -244,8 +256,16 @@ class ContentAddressedStore:
             if not isinstance(tenant, str) or _TENANT_RE.match(tenant) is None:
                 raise ObjectStoreError("corrupted index: bad lifecycle tenant")
             lifecycle[tenant] = self._validate_lifecycle_policy(policy)
+        access = {}
+        raw_access = document.get("access", {})
+        if not isinstance(raw_access, dict):
+            raise ObjectStoreError("corrupted index: access is not a map")
+        for tenant, policy in raw_access.items():
+            if not isinstance(tenant, str) or _TENANT_RE.match(tenant) is None:
+                raise ObjectStoreError("corrupted index: bad access tenant")
+            access[tenant] = self._validate_access_policy(policy)
         return (objects, timestamps, records, versioning, versions,
-                retention, quota, lifecycle)
+                retention, quota, lifecycle, access)
 
     def _load_object_map(self, mapping):
         objects, timestamps = {}, {}
@@ -341,6 +361,20 @@ class ContentAddressedStore:
         return {"prefix": prefix, "max_age_seconds": max_age}
 
     @staticmethod
+    def _validate_access_policy(policy):
+        if not isinstance(policy, dict):
+            raise ObjectStoreError("corrupted index: bad access policy")
+        mode = policy.get("mode")
+        if mode == "public":
+            return {"mode": "public"}
+        if mode == "signed":
+            secret = policy.get("secret")
+            if not isinstance(secret, str) or not 16 <= len(secret) <= 256:
+                raise ObjectStoreError("corrupted index: bad access policy")
+            return {"mode": "signed", "secret": secret}
+        raise ObjectStoreError("corrupted index: bad access policy")
+
+    @staticmethod
     def _stored_entry(entry, last_modified):
         """Return the on-disk form of *entry*, adding *last_modified* when set."""
         saved = dict(entry)
@@ -388,6 +422,8 @@ class ContentAddressedStore:
             document["quota"] = self._quota
         if self._lifecycle:
             document["lifecycle"] = self._lifecycle
+        if self._access:
+            document["access"] = self._access
         payload = json.dumps(document, sort_keys=True, separators=(",", ":"))
         _atomic_write(self.index_path, payload.encode("utf-8") + b"\n")
 
@@ -546,25 +582,42 @@ class ContentAddressedStore:
         except OSError:
             raise ObjectStoreError("blob io error")
 
-    def get(self, key, tenant=DEFAULT_TENANT):
-        """Return ``(payload, entry)`` for *key* in *tenant*."""
+    def get(self, key, tenant=DEFAULT_TENANT, expires=None, signature=None):
+        """Return ``(payload, entry)`` for *key* in *tenant*.
+
+        When *tenant* has a signed access policy, the read is authorized
+        before the key is looked up: *expires* and *signature* must
+        authenticate it (see :meth:`sign_request`) or
+        ``ObjectStoreError("access denied")`` is raised. Under the default
+        public policy both are ignored.
+        """
         self._check_tenant(tenant)
+        self._check_key(key)
         with self._lock:
-            entry = self.head(key, tenant=tenant)
+            self._authorize_read(tenant, "GET", key, None, expires, signature)
+            entry = self._head_unlocked(tenant, key)
             data = self.blob(entry["sha256"])
             if len(data) != entry["size"]:
                 raise ObjectStoreError("corrupted blob")
             return data, entry
 
-    def head(self, key, tenant=DEFAULT_TENANT):
-        """Return a copy of the metadata entry for *key* in *tenant*."""
+    def head(self, key, tenant=DEFAULT_TENANT, expires=None, signature=None):
+        """Return a copy of the metadata entry for *key* in *tenant*.
+
+        A signed tenant policy gates this read exactly like :meth:`get`.
+        """
         self._check_tenant(tenant)
         self._check_key(key)
         with self._lock:
-            entry = self._objects.get(tenant, {}).get(key)
-            if entry is None:
-                raise ObjectStoreError("not found: %s" % (key,))
-            return dict(entry)
+            self._authorize_read(tenant, "HEAD", key, None, expires, signature)
+            return self._head_unlocked(tenant, key)
+
+    def _head_unlocked(self, tenant, key):
+        """Return *key*'s metadata entry; must be called under the lock."""
+        entry = self._objects.get(tenant, {}).get(key)
+        if entry is None:
+            raise ObjectStoreError("not found: %s" % (key,))
+        return dict(entry)
 
     def delete(self, key, expected_sha256=_MISSING, tenant=DEFAULT_TENANT):
         """Drop *key* in *tenant*; shared blobs stay on disk for other keys.
@@ -1263,37 +1316,51 @@ class ContentAddressedStore:
                     "next_after": page[-1]["version_id"]
                     if len(ordered) > len(page) else None}
 
-    def head_version(self, key, version_id, tenant=DEFAULT_TENANT):
+    def head_version(self, key, version_id, tenant=DEFAULT_TENANT,
+                     expires=None, signature=None):
         """Return the metadata of one version of *key* in *tenant*.
 
         The result holds ``version_id``, ``sha256``, ``size``,
         ``content_type``, ``created_at`` and a ``current`` flag. A
         malformed *version_id* raises ``invalid version`` and an unknown
         key or version raises ``not found``; the tenant must have
-        versioning enabled.
+        versioning enabled. A signed tenant policy gates this read exactly
+        like :meth:`get`, authorized before the key or version is looked
+        up.
         """
         self._check_tenant(tenant)
         self._check_key(key)
         with self._lock:
-            self._require_versioning(tenant)
-            self._check_version_id(version_id)
-            versions = self._versions_of(tenant, key)
-            for version in versions:
-                if version["version_id"] == version_id:
-                    entry = self._version_item(version, versions[-1]["version_id"])
-                    entry["content_type"] = version["content_type"]
-                    return entry
-            raise ObjectStoreError("not found: version %s" % (version_id,))
+            self._authorize_read(tenant, "HEAD", key, version_id,
+                                 expires, signature)
+            return self._head_version_unlocked(tenant, key, version_id)
 
-    def get_version(self, key, version_id, tenant=DEFAULT_TENANT):
+    def _head_version_unlocked(self, tenant, key, version_id):
+        """Return one version's metadata; must be called under the lock."""
+        self._require_versioning(tenant)
+        self._check_version_id(version_id)
+        versions = self._versions_of(tenant, key)
+        for version in versions:
+            if version["version_id"] == version_id:
+                entry = self._version_item(version, versions[-1]["version_id"])
+                entry["content_type"] = version["content_type"]
+                return entry
+        raise ObjectStoreError("not found: version %s" % (version_id,))
+
+    def get_version(self, key, version_id, tenant=DEFAULT_TENANT,
+                    expires=None, signature=None):
         """Return ``(payload, entry)`` for one version of *key*.
 
         The blob bytes are verified against the version's digest and size
-        exactly like :meth:`get` verifies the current object.
+        exactly like :meth:`get` verifies the current object, and a signed
+        tenant policy gates the read exactly like :meth:`get`.
         """
         self._check_tenant(tenant)
+        self._check_key(key)
         with self._lock:
-            entry = self.head_version(key, version_id, tenant=tenant)
+            self._authorize_read(tenant, "GET", key, version_id,
+                                 expires, signature)
+            entry = self._head_version_unlocked(tenant, key, version_id)
             data = self.blob(entry["sha256"])
             if len(data) != entry["size"]:
                 raise ObjectStoreError("corrupted blob")
@@ -1777,3 +1844,140 @@ class ContentAddressedStore:
                 self._versions = saved_versions
                 raise ObjectStoreError("lifecycle io error")
             return result
+
+    # -- access policy and signed reads ----------------------------------
+    def set_access_policy(self, mode, secret=None, tenant=DEFAULT_TENANT):
+        """Save *tenant*'s access policy.
+
+        *mode* must be ``"public"`` (no *secret*; equivalent to
+        :meth:`clear_access_policy`) or ``"signed"`` with a UTF-8 *secret*
+        of 16 to 256 characters; anything else raises
+        ``ObjectStoreError("invalid access policy")``. The policy is
+        persisted with the index; an I/O failure while saving raises
+        ``ObjectStoreError("access policy io error")`` and keeps the
+        previous policy.
+        """
+        self._check_tenant(tenant)
+        if mode not in ("public", "signed"):
+            raise ObjectStoreError("invalid access policy")
+        if mode == "signed":
+            if not isinstance(secret, str) or not 16 <= len(secret) <= 256:
+                raise ObjectStoreError("invalid access policy")
+        elif secret is not None:
+            raise ObjectStoreError("invalid access policy")
+        with self._lock:
+            previous = self._access.get(tenant)
+            if mode == "signed":
+                self._access[tenant] = {"mode": "signed", "secret": secret}
+            else:
+                self._access.pop(tenant, None)
+            try:
+                self._save_index()
+            except OSError:
+                if previous is None:
+                    self._access.pop(tenant, None)
+                else:
+                    self._access[tenant] = previous
+                raise ObjectStoreError("access policy io error")
+
+    def get_access_policy(self, tenant=DEFAULT_TENANT):
+        """Return *tenant*'s access policy as ``{"mode": ...}``.
+
+        Tenants without a saved policy read as ``{"mode": "public"}``; the
+        persisted secret is never included in the result.
+        """
+        self._check_tenant(tenant)
+        with self._lock:
+            policy = self._access.get(tenant)
+            if policy is None:
+                return {"mode": "public"}
+            return {"mode": policy["mode"]}
+
+    def clear_access_policy(self, tenant=DEFAULT_TENANT):
+        """Drop *tenant*'s access policy, restoring public reads.
+
+        Clearing a tenant without a policy is a no-op. An I/O failure while
+        saving raises ``ObjectStoreError("access policy io error")`` and
+        keeps the previous policy.
+        """
+        self._check_tenant(tenant)
+        with self._lock:
+            previous = self._access.pop(tenant, None)
+            try:
+                self._save_index()
+            except OSError:
+                if previous is not None:
+                    self._access[tenant] = previous
+                raise ObjectStoreError("access policy io error")
+
+    @staticmethod
+    def _signature_payload(tenant, method, key, version_id, expires):
+        """Return the newline-joined bytes a read signature is computed over."""
+        if not isinstance(version_id, str):
+            version_id = ""
+        fields = (tenant, method, key, version_id, str(expires))
+        return "\n".join(fields).encode("utf-8")
+
+    @classmethod
+    def _signature(cls, tenant, secret, method, key, version_id, expires):
+        """Return the lowercase hex HMAC-SHA256 of one signed-read payload."""
+        return hmac.new(
+            secret.encode("utf-8"),
+            cls._signature_payload(tenant, method, key, version_id, expires),
+            hashlib.sha256).hexdigest()
+
+    def sign_request(self, method, key, version_id=None, expires=None,
+                     tenant=DEFAULT_TENANT):
+        """Sign one object or version read for *tenant* and return the hex MAC.
+
+        The signature is the HMAC-SHA256 under the tenant's persisted
+        secret of the tenant name, HTTP *method*, object *key*, optional
+        *version_id* and *expires* timestamp joined by newlines. *method*
+        must be ``"GET"`` or ``"HEAD"`` and *expires* an integer timestamp
+        in the future; a bad method, expiry or version id, or a tenant
+        without a signed policy, raises
+        ``ObjectStoreError("invalid signature")``.
+        """
+        self._check_tenant(tenant)
+        self._check_key(key)
+        if method not in ("GET", "HEAD"):
+            raise ObjectStoreError("invalid signature")
+        if version_id is not None and (
+                not isinstance(version_id, str)
+                or _VERSION_ID_RE.match(version_id) is None):
+            raise ObjectStoreError("invalid signature")
+        if isinstance(expires, bool) or not isinstance(expires, int) \
+                or expires <= time.time():
+            raise ObjectStoreError("invalid signature")
+        with self._lock:
+            policy = self._access.get(tenant)
+            if policy is None or policy["mode"] != "signed":
+                raise ObjectStoreError("invalid signature")
+            return self._signature(tenant, policy["secret"], method, key,
+                                   version_id, expires)
+
+    def _authorize_read(self, tenant, method, key, version_id, expires,
+                        signature):
+        """Enforce *tenant*'s access policy for one read; no-op when public.
+
+        Must be called under the store lock, before the key or version is
+        looked up. A signed policy requires a future integer *expires* and
+        the matching lowercase hex *signature*, compared in constant time;
+        anything else raises ``ObjectStoreError("access denied")``.
+        """
+        policy = self._access.get(tenant)
+        if policy is None or policy["mode"] != "signed":
+            return
+        if isinstance(expires, bool) or not isinstance(expires, int) \
+                or expires <= time.time():
+            raise ObjectStoreError("access denied")
+        if not isinstance(signature, str):
+            raise ObjectStoreError("access denied")
+        expected = self._signature(tenant, policy["secret"], method, key,
+                                   version_id, expires)
+        try:
+            matched = hmac.compare_digest(expected, signature)
+        except TypeError:
+            matched = False
+        if not matched:
+            raise ObjectStoreError("access denied")

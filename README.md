@@ -407,6 +407,59 @@ tenant"}`, and a persistence failure returns `500 {"error":"lifecycle io
 error"}` with nothing changed. Tenants without a policy and the command line
 interface are unchanged by this feature.
 
+### Access policies and signed reads
+
+Each tenant carries an access policy of either `public` — the default, which
+keeps every historical behaviour exactly — or `signed` with a persisted UTF-8
+secret of 16 to 256 characters. Any other mode or secret raises
+`ObjectStoreError("invalid access policy")`:
+
+```python
+store.set_access_policy("signed", secret="0123456789abcdef", tenant="acme")
+store.get_access_policy(tenant="acme")   # -> {"mode": "signed"} (never the secret)
+store.clear_access_policy(tenant="acme") # back to public
+```
+
+The policy is persisted atomically with the index; an I/O failure while
+saving raises `ObjectStoreError("access policy io error")` and keeps the
+previous policy. While a tenant is signed, object and version `get`/`head`
+reads must be authorized with a signature produced by `sign_request` — the
+lowercase hex HMAC-SHA256 under the tenant's secret of the tenant name, the
+HTTP method (`GET` or `HEAD`), the object key, the optional version id and
+the expiry timestamp joined by newlines:
+
+```python
+expires = int(time.time()) + 600
+signature = store.sign_request("GET", "docs/a.txt", expires=expires, tenant="acme")
+payload, entry = store.get("docs/a.txt", tenant="acme",
+                           expires=expires, signature=signature)
+```
+
+`sign_request` rejects any method but `GET`/`HEAD`, a non-integer or
+non-future `expires`, a malformed version id and tenants without a signed
+policy with `ObjectStoreError("invalid signature")`. On reads, a missing,
+malformed, expired or mismatching expiry or signature raises
+`ObjectStoreError("access denied")` — verified in constant time before the
+key or version is ever looked up, so a denied read of an unknown key is
+indistinguishable from a denied read of an existing one, while a validly
+signed read of an unknown key still raises the usual `not found`. Writes,
+deletes, listings, uploads and blob reads are not gated, and public tenants
+ignore `expires`/`signature` entirely.
+
+The HTTP surface grows one tenant-scoped endpoint (tenant selected through
+`X-Objstore-Tenant` as usual): `GET /v1/access-policy` returns
+`{"mode": "public"|"signed"}`, `PUT /v1/access-policy` accepts a JSON object
+with `mode` and, for the signed mode, `secret` (invalid JSON or an invalid
+policy returns `400 {"error":"invalid access policy"}`, a persistence
+failure `500 {"error":"access policy io error"}` with the old policy kept),
+and `DELETE /v1/access-policy` restores the public default. While the tenant
+is signed, object and version `GET`/`HEAD` requests must carry `expires` and
+`signature` query parameters; a missing, repeated, malformed, expired or
+mismatching value returns `403 {"error":"access denied"}`, a validly signed
+request for an unknown key or version still returns `404`, and successful
+responses keep their `ETag` and `X-Content-Sha256` headers. The command line
+interface is unchanged by this feature.
+
 
 
 ## Tests
@@ -456,8 +509,8 @@ checks.
 | --- | --- | --- | --- |
 | GET | `/healthz` | 200 `{"ok": true}` | 405 |
 | PUT | `/v1/objects/{key}` | 201 `{"key","sha256","size"}` on first store; 200 with the same body when the same bytes are stored again | 400 invalid key / invalid precondition, 411 missing Content-Length, 405, 412 precondition failed, 413 quota exceeded, 500 blob io error |
-| GET | `/v1/objects/{key}` | 200 raw bytes, headers `Content-Type`, `X-Content-Sha256` and `ETag` (`"<sha256>"`) | 404 unknown key, 400 invalid key, 405, 500 corrupted blob / blob io error |
-| HEAD | `/v1/objects/{key}` | 200 no body, headers `Content-Length`, `X-Content-Sha256` and `ETag` | 404 unknown key, 400 invalid key, 405 |
+| GET | `/v1/objects/{key}` | 200 raw bytes, headers `Content-Type`, `X-Content-Sha256` and `ETag` (`"<sha256>"`) | 404 unknown key, 400 invalid key, 403 access denied (signed tenant, bad/missing `expires`/`signature`), 405, 500 corrupted blob / blob io error |
+| HEAD | `/v1/objects/{key}` | 200 no body, headers `Content-Length`, `X-Content-Sha256` and `ETag` | 404 unknown key, 400 invalid key, 403 access denied, 405 |
 | DELETE | `/v1/objects/{key}` | 204 no body | 404 unknown key, 400 invalid key / invalid precondition, 405, 412 precondition failed |
 | GET | `/v1/objects?prefix=&after=&limit=` | 200 `{"items":[{"key","sha256","size","content_type"}],"next_after":<str or null>}` | 400 invalid limit, 400 invalid prefix, 400 invalid after, 405 |
 | GET | `/v1/blobs/{sha256}` | 200 raw bytes of that content, header `X-Content-Sha256` | 400 invalid sha256, 404 unknown digest, 405, 500 corrupted blob / blob io error |
@@ -469,8 +522,8 @@ checks.
 | GET | `/v1/versioning` | 200 `{"enabled": <bool>}` for the selected tenant | 400 invalid tenant, 405 |
 | PUT | `/v1/versioning` | 200 `{"enabled": <bool>}`; body is a JSON object with a boolean `enabled` | 400 invalid json / invalid versioning, 405, 411 |
 | GET | `/v1/objects/{key}/versions?after=&limit=` | 200 `{"items":[{"version_id","sha256","size","created_at","current"}],"next_after":<str or null>}`, newest first | 400 invalid key / invalid limit / invalid version / versioning disabled, 404 unknown key, 405 |
-| GET | `/v1/objects/{key}/versions/{version_id}` | 200 raw bytes of that version, headers `Content-Type`, `X-Content-Sha256` and `ETag` | 400 invalid key / invalid version / versioning disabled, 404 unknown key or version, 405, 500 corrupted blob / blob io error |
-| HEAD | `/v1/objects/{key}/versions/{version_id}` | 200 no body, headers `Content-Length`, `X-Content-Sha256` and `ETag` | 400 invalid key / invalid version / versioning disabled, 404 unknown key or version, 405 |
+| GET | `/v1/objects/{key}/versions/{version_id}` | 200 raw bytes of that version, headers `Content-Type`, `X-Content-Sha256` and `ETag` | 400 invalid key / invalid version / versioning disabled, 403 access denied, 404 unknown key or version, 405, 500 corrupted blob / blob io error |
+| HEAD | `/v1/objects/{key}/versions/{version_id}` | 200 no body, headers `Content-Length`, `X-Content-Sha256` and `ETag` | 400 invalid key / invalid version / versioning disabled, 403 access denied, 404 unknown key or version, 405 |
 | DELETE | `/v1/objects/{key}/versions/{version_id}` | 204 no body; deleting the current version promotes the newest remaining one | 400 invalid key / invalid version / versioning disabled, 404 unknown key or version, 405 |
 | GET | `/v1/retention` | 200 `{"max_versions": <int|null>, "max_age_seconds": <int|null>}` | 400 invalid tenant, 405 |
 | PUT | `/v1/retention` | 200 with the saved policy; body holds at least one of the two non-negative integer limits | 400 invalid json / invalid retention, 405, 411 |
@@ -483,6 +536,9 @@ checks.
 | PUT | `/v1/lifecycle` | 200 with the saved policy; body is a JSON object with required non-negative integer `max_age_seconds`, optional string `prefix` (default `""`) and no other fields | 400 invalid json / invalid lifecycle, 405, 411, 500 lifecycle io error |
 | DELETE | `/v1/lifecycle` | 200 `null`; clears the policy (idempotent) | 400 invalid tenant, 405, 500 lifecycle io error |
 | POST | `/v1/lifecycle/run` | 200 `{"objects":[{"key","sha256","size"}],"bytes":<int>,"dry_run":<bool>}`; optional body `{"dry_run": <bool>}` (default `true`); a real run removes expired current references under one atomic rewrite | 400 invalid json / invalid dry_run / invalid tenant, 405, 500 lifecycle io error |
+| GET | `/v1/access-policy` | 200 `{"mode": "public"\|"signed"}` for the selected tenant | 400 invalid tenant, 405 |
+| PUT | `/v1/access-policy` | 200 with the saved mode; body is a JSON object with `mode` (`public` or `signed`) plus a 16–256 character UTF-8 `secret` for the signed mode and no other fields | 400 invalid access policy (invalid JSON included), 405, 411, 500 access policy io error |
+| DELETE | `/v1/access-policy` | 200 `{"mode": "public"}`; restores the public default | 400 invalid tenant, 405, 500 access policy io error |
 
 Notes:
 
@@ -545,7 +601,9 @@ Upload session notes:
                         #  "retention":{"<tenant>":{"max_versions"?,"max_age_seconds"?}},
                         #  "quota":{"<tenant>":{"max_bytes"?,"max_objects"?}},
                         #  "lifecycle":{"<tenant>":{"prefix","max_age_seconds"}}
-                        #  (only tenants with a saved policy)}
+                        #  (only tenants with a saved policy),
+                        #  "access":{"<tenant>":{"mode":"signed","secret"}}
+                        #  (only tenants with a saved signed policy)}
   blobs/<sha256>        # raw object bytes, one file per distinct digest
   uploads/<session>.json  # active upload declaration plus confirmed offset, tenant
                           # (non-default only) and optional expected_sha256 publish
@@ -562,15 +620,16 @@ never wrote. Indexes written before quotas existed have no `quota` map, so
 every tenant starts unlimited. Indexes written before lifecycle existed have
 no `lifecycle` map and their entries lack `last_modified`; those directories
 open unchanged and the timeless entries are never expired by a lifecycle
-run.
+run. Indexes written before access policies existed have no `access` map, so
+every tenant starts public and reads behave exactly as before.
 
 ## Limits of this seed
 
 The following long-term goals are intentionally not implemented yet:
 rate limiting, consistent hashing and rebalancing, erasure coding and
-repair, signed URLs and access control, cross-region replication and
-end-to-end audit logging. Resumable uploads are exposed through the
-Python API and the HTTP surface; the command line interface does not
-expose them yet, and likewise exposes no versioning, retention, quota or
-lifecycle commands.
-Authentication is out of scope: the server trusts every caller.
+repair, cross-region replication and end-to-end audit logging. Resumable
+uploads are exposed through the Python API and the HTTP surface; the command
+line interface does not expose them yet, and likewise exposes no versioning,
+retention, quota, lifecycle or access-policy commands.
+Authentication is out of scope: beyond the optional per-tenant signed-read
+policy, the server trusts every caller.

@@ -1,16 +1,21 @@
 """Standard-library HTTP front end for :class:`ContentAddressedStore`.
 
 Every failure is a single-line JSON body ``{"error": "..."}`` with status 400,
-404, 405, 409, 411, 412, 413 or 500 (500 for a corrupted blob or a blob/upload
-I/O error, 413 for a write rejected by the tenant's quota).
+403, 404, 405, 409, 411, 412, 413 or 500 (500 for a corrupted blob or a
+blob/upload I/O error, 413 for a write rejected by the tenant's quota, 403
+for a read rejected by the tenant's signed access policy).
 
 The object and upload-session endpoints select their tenant through the
 optional ``X-Objstore-Tenant`` request header (default ``default``); the blob
 endpoints stay global and ignore it. The versioning and retention endpoints
 (``/v1/versioning``, ``/v1/objects/{key}/versions[...]``, ``/v1/retention``
 and ``/v1/retention/purge``), the quota endpoints (``/v1/quota`` and
-``/v1/usage``) and the lifecycle endpoints (``/v1/lifecycle`` and
-``/v1/lifecycle/run``) are tenant-scoped the same way.
+``/v1/usage``), the lifecycle endpoints (``/v1/lifecycle`` and
+``/v1/lifecycle/run``) and the access-policy endpoint (``/v1/access-policy``)
+are tenant-scoped the same way. While a tenant's policy is ``signed``, object
+and version GET/HEAD requests must carry a future ``expires`` timestamp and a
+matching ``signature`` query parameter or they fail with
+``403 {"error":"access denied"}``; public tenants ignore both parameters.
 """
 
 from __future__ import annotations
@@ -44,6 +49,7 @@ _QUOTA_PATH = "/v1/quota"
 _USAGE_PATH = "/v1/usage"
 _LIFECYCLE_PATH = "/v1/lifecycle"
 _LIFECYCLE_RUN_PATH = "/v1/lifecycle/run"
+_ACCESS_POLICY_PATH = "/v1/access-policy"
 _TENANT_HEADER = "X-Objstore-Tenant"
 _DEFAULT_CONTENT_TYPE = "application/octet-stream"
 _DECIMAL_RE = re.compile(r"\A[0-9]+\Z")
@@ -52,10 +58,12 @@ _BAD_REQUEST_PREFIXES = (
     "invalid after", "invalid size", "invalid offset", "invalid json",
     "invalid precondition", "invalid tenant", "invalid version",
     "invalid retention", "invalid dry_run", "invalid quota",
-    "invalid lifecycle", "versioning disabled", "payload", "content_type",
+    "invalid lifecycle", "invalid access policy", "versioning disabled",
+    "payload", "content_type",
 )
 _INTERNAL_ERRORS = ("corrupted blob", "blob io error", "upload io error",
-                    "version io error", "quota io error", "lifecycle io error")
+                    "version io error", "quota io error", "lifecycle io error",
+                    "access policy io error")
 
 
 def _json_bytes(payload):
@@ -69,6 +77,8 @@ def _status_for(message):
         return 412
     if message == "quota exceeded":
         return 413
+    if message == "access denied":
+        return 403
     for prefix in _BAD_REQUEST_PREFIXES:
         if message.startswith(prefix):
             return 400
@@ -215,6 +225,8 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
                 if method != "POST":
                     return self._error(405, "method not allowed")
                 return self._run_lifecycle(tenant)
+            if path == _ACCESS_POLICY_PATH:
+                return self._access_policy(method, self._tenant())
             if path.startswith(_OBJECTS_PATH + "/"):
                 return self._object(method, unquote(path[len(_OBJECTS_PATH) + 1:]),
                                     parsed.query)
@@ -260,6 +272,28 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
                 return key, version_id, True
         return tail, None, False
 
+    @staticmethod
+    def _access_params(query):
+        """Extract the ``expires``/``signature`` query values of a signed read.
+
+        Returns ``(expires, signature)`` with *expires* as an integer.
+        Anything but a single decimal ``expires`` and a single ``signature``
+        value collapses to ``None``, which the store rejects as
+        ``access denied`` while the tenant's policy is signed; public
+        tenants ignore both.
+        """
+        params = parse_qs(query, keep_blank_values=True)
+        expires = None
+        values = params.get("expires")
+        if values is not None and len(values) == 1 \
+                and _DECIMAL_RE.match(values[0]) is not None:
+            expires = int(values[0])
+        signature = None
+        values = params.get("signature")
+        if values is not None and len(values) == 1:
+            signature = values[0]
+        return expires, signature
+
     def _object(self, method, tail, query=""):
         tenant = self._tenant()
         if not tail:
@@ -270,7 +304,7 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
                 if method != "GET":
                     return self._error(405, "method not allowed")
                 return self._list_versions(key, query, tenant)
-            return self._version_item(method, key, version_id, tenant)
+            return self._version_item(method, key, version_id, tenant, query)
         store = self.server.store
         if method == "PUT":
             body = self._read_body()
@@ -290,11 +324,15 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
                 body_out["version_id"] = entry["version_id"]
             return self._send(200 if repeated else 201, _json_bytes(body_out))
         if method == "GET":
-            data, entry = store.get(key, tenant=tenant)
+            expires, signature = self._access_params(query)
+            data, entry = store.get(key, tenant=tenant, expires=expires,
+                                    signature=signature)
             return self._send(200, data, entry["content_type"] or _DEFAULT_CONTENT_TYPE,
                               self._etag_headers(entry))
         if method == "HEAD":
-            entry = store.head(key, tenant=tenant)
+            expires, signature = self._access_params(query)
+            entry = store.head(key, tenant=tenant, expires=expires,
+                               signature=signature)
             return self._send(200, b"", entry["content_type"] or _DEFAULT_CONTENT_TYPE,
                               self._etag_headers(entry), head_only=True,
                               length=entry["size"])
@@ -461,15 +499,19 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
             limit=limit, tenant=tenant)
         return self._send(200, _json_bytes(result))
 
-    def _version_item(self, method, key, version_id, tenant):
+    def _version_item(self, method, key, version_id, tenant, query=""):
         store = self.server.store
         if method == "GET":
-            data, entry = store.get_version(key, version_id, tenant=tenant)
+            expires, signature = self._access_params(query)
+            data, entry = store.get_version(key, version_id, tenant=tenant,
+                                            expires=expires, signature=signature)
             return self._send(200, data,
                               entry["content_type"] or _DEFAULT_CONTENT_TYPE,
                               self._etag_headers(entry))
         if method == "HEAD":
-            entry = store.head_version(key, version_id, tenant=tenant)
+            expires, signature = self._access_params(query)
+            entry = store.head_version(key, version_id, tenant=tenant,
+                                       expires=expires, signature=signature)
             return self._send(200, b"",
                               entry["content_type"] or _DEFAULT_CONTENT_TYPE,
                               self._etag_headers(entry), head_only=True,
@@ -607,6 +649,32 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
                 dry_run = document.get("dry_run", True)
         result = self.server.store.run_lifecycle(dry_run=dry_run, tenant=tenant)
         return self._send(200, _json_bytes(result))
+
+    def _access_policy(self, method, tenant):
+        store = self.server.store
+        if method == "GET":
+            return self._send(200, _json_bytes(
+                store.get_access_policy(tenant=tenant)))
+        if method == "DELETE":
+            store.clear_access_policy(tenant=tenant)
+            return self._send(200, _json_bytes({"mode": "public"}))
+        if method != "PUT":
+            return self._error(405, "method not allowed")
+        body, error = self._read_length_body()
+        if error is not None:
+            return self._error(*error)
+        # Both undecodable JSON and an invalid policy are reported as the
+        # same "invalid access policy" error on this endpoint.
+        try:
+            document = self._json_object(body)
+        except ObjectStoreError:
+            raise ObjectStoreError("invalid access policy")
+        if set(document) - {"mode", "secret"}:
+            raise ObjectStoreError("invalid access policy")
+        store.set_access_policy(document.get("mode"),
+                                secret=document.get("secret"), tenant=tenant)
+        return self._send(200, _json_bytes(
+            store.get_access_policy(tenant=tenant)))
 
     def _blob(self, sha256):
         if _SHA256_RE.match(sha256) is None:
