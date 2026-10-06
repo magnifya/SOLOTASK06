@@ -1,8 +1,10 @@
 """Standard-library HTTP front end for :class:`ContentAddressedStore`.
 
 Every failure is a single-line JSON body ``{"error": "..."}`` with status 400,
-404, 405, 409, 411, 412, 413 or 500 (500 for a corrupted blob or a blob/upload
-I/O error, 413 for a write rejected by the tenant's quota).
+404, 405, 409, 411, 412, 413, 429 or 500 (500 for a corrupted blob or a
+blob/upload I/O error, 413 for a write rejected by the tenant's quota, 429
+for a request rejected by the tenant's rate limit, with a ``Retry-After``
+header holding the seconds left in the current window).
 
 The object and upload-session endpoints select their tenant through the
 optional ``X-Objstore-Tenant`` request header (default ``default``); the blob
@@ -10,8 +12,15 @@ endpoints stay global and ignore it. The versioning and retention endpoints
 (``/v1/versioning``, ``/v1/objects/{key}/versions[...]``, ``/v1/retention``
 and ``/v1/retention/purge``), the quota endpoints (``/v1/quota`` and
 ``/v1/usage``), the lifecycle endpoints (``/v1/lifecycle`` and
-``/v1/lifecycle/run``) and the access-policy endpoint
-(``/v1/access-policy``) are tenant-scoped the same way.
+``/v1/lifecycle/run``), the access-policy endpoint
+(``/v1/access-policy``) and the rate-limit endpoints (``/v1/rate-limit``
+and ``/v1/rate-limit/usage``) are tenant-scoped the same way.
+
+While a tenant has a rate limit policy, every request to those endpoints
+(except ``/healthz`` and the rate-limit management endpoints themselves) is
+charged against the tenant's current fixed window once it has passed
+validation; ``PUT`` object bodies and upload chunk bodies additionally count
+against ``max_bytes``.
 
 While a tenant's access policy is ``signed``, object and version GET/HEAD
 requests must carry ``expires`` and ``signature`` query parameters holding
@@ -52,6 +61,8 @@ _USAGE_PATH = "/v1/usage"
 _LIFECYCLE_PATH = "/v1/lifecycle"
 _LIFECYCLE_RUN_PATH = "/v1/lifecycle/run"
 _ACCESS_POLICY_PATH = "/v1/access-policy"
+_RATE_LIMIT_PATH = "/v1/rate-limit"
+_RATE_LIMIT_USAGE_PATH = "/v1/rate-limit/usage"
 _TENANT_HEADER = "X-Objstore-Tenant"
 _DEFAULT_CONTENT_TYPE = "application/octet-stream"
 _DECIMAL_RE = re.compile(r"\A[0-9]+\Z")
@@ -60,12 +71,13 @@ _BAD_REQUEST_PREFIXES = (
     "invalid after", "invalid size", "invalid offset", "invalid json",
     "invalid precondition", "invalid tenant", "invalid version",
     "invalid retention", "invalid dry_run", "invalid quota",
-    "invalid lifecycle", "invalid access policy", "versioning disabled",
+    "invalid lifecycle", "invalid access policy", "invalid rate limit",
+    "versioning disabled",
     "payload", "content_type",
 )
 _INTERNAL_ERRORS = ("corrupted blob", "blob io error", "upload io error",
                     "version io error", "quota io error", "lifecycle io error",
-                    "access policy io error")
+                    "access policy io error", "rate limit io error")
 
 
 def _json_bytes(payload):
@@ -79,6 +91,8 @@ def _status_for(message):
         return 412
     if message == "quota exceeded":
         return 413
+    if message == "rate limit exceeded":
+        return 429
     if message == "access denied":
         return 403
     for prefix in _BAD_REQUEST_PREFIXES:
@@ -229,6 +243,14 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
                 return self._run_lifecycle(tenant)
             if path == _ACCESS_POLICY_PATH:
                 return self._access_policy(method, self._tenant())
+            if path == _RATE_LIMIT_PATH:
+                return self._rate_limit(method, self._tenant())
+            if path == _RATE_LIMIT_USAGE_PATH:
+                tenant = self._tenant()
+                if method != "GET":
+                    return self._error(405, "method not allowed")
+                return self._send(200, _json_bytes(
+                    self.server.store.get_rate_limit_usage(tenant=tenant)))
             if path.startswith(_OBJECTS_PATH + "/"):
                 return self._object(method, unquote(path[len(_OBJECTS_PATH) + 1:]),
                                     parsed.query)
@@ -253,9 +275,27 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
         except SessionConflict as exc:
             return self._error(409, str(exc))
         except ObjectStoreError as exc:
+            if str(exc) == "rate limit exceeded":
+                return self._rate_limited()
             return self._error(_status_for(str(exc)), str(exc))
         except (BrokenPipeError, ConnectionResetError):
             return None
+
+    def _rate_limited(self):
+        """Send the 429 for a request rejected by the tenant's rate limit.
+
+        ``Retry-After`` holds the seconds left in the tenant's current
+        window, at least 1. The tenant header was already validated before
+        the request was charged, so re-reading it here cannot fail; the
+        fallback is purely defensive.
+        """
+        try:
+            tenant = self._tenant()
+        except ObjectStoreError:
+            tenant = DEFAULT_TENANT
+        retry_after = self.server.store._rate_limit_retry_after(tenant)
+        self._send(429, _json_bytes({"error": "rate limit exceeded"}),
+                   extra_headers=[("Retry-After", str(retry_after))])
 
     @staticmethod
     def _split_version_tail(tail):
@@ -293,7 +333,10 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
             ContentAddressedStore._check_key(key)
             expected = self._precondition_headers()
             try:
-                existing = store.head(key, tenant=tenant)
+                # The existence check is part of this one request; only the
+                # put itself is charged against the tenant's rate limit.
+                with store._suppress_rate_limit():
+                    existing = store.head(key, tenant=tenant)
             except ObjectStoreError:
                 existing = None
             entry = store.put(key, body, content_type=self.headers.get("Content-Type"),
@@ -652,8 +695,39 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
             raise ObjectStoreError("invalid access policy")
         store.set_access_policy(document.get("mode"),
                                 secret=document.get("secret"), tenant=tenant)
+        with store._suppress_rate_limit():
+            mode = store.get_access_policy(tenant=tenant)["mode"]
+        return self._send(200, _json_bytes({"mode": mode}))
+
+    # -- rate limiting ----------------------------------------------------
+    def _rate_limit(self, method, tenant):
+        store = self.server.store
+        if method == "GET":
+            return self._send(200, _json_bytes(
+                store.get_rate_limit(tenant=tenant)))
+        if method == "DELETE":
+            store.clear_rate_limit(tenant=tenant)
+            return self._send(200, _json_bytes(None))
+        if method != "PUT":
+            return self._error(405, "method not allowed")
+        body, error = self._read_length_body()
+        if error is not None:
+            return self._error(*error)
+        # Every body problem -- unparseable JSON, a non-object document,
+        # unknown fields, a missing window or limit, a bad value -- is the
+        # same 400 here.
+        try:
+            document = self._json_object(body)
+        except ObjectStoreError:
+            raise ObjectStoreError("invalid rate limit")
+        if set(document) - {"window_seconds", "max_requests", "max_bytes"}:
+            raise ObjectStoreError("invalid rate limit")
+        store.set_rate_limit(document.get("window_seconds"),
+                             max_requests=document.get("max_requests"),
+                             max_bytes=document.get("max_bytes"),
+                             tenant=tenant)
         return self._send(200, _json_bytes(
-            {"mode": store.get_access_policy(tenant=tenant)["mode"]}))
+            store.get_rate_limit(tenant=tenant)))
 
     def _access_params(self, query, tenant):
         """Return the ``expires``/``signature`` kwargs for a signed read.
@@ -664,7 +738,10 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
         or malformed parameters are an ``access denied`` error raised
         before any object or version is looked up.
         """
-        if self.server.store.get_access_policy(tenant=tenant)["mode"] != "signed":
+        store = self.server.store
+        with store._suppress_rate_limit():
+            mode = store.get_access_policy(tenant=tenant)["mode"]
+        if mode != "signed":
             return {}
         params = parse_qs(query, keep_blank_values=True)
         expires = params.get("expires")

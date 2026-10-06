@@ -15,8 +15,8 @@ collection, metadata indexing and listing, quotas and rate limiting, consistent
 hashing and rebalancing, erasure coding and repair, signed URLs and access
 control, cross-region replication and end-to-end audit. Multi-tenant namespaces,
 conditional writes, resumable uploads, object versioning with retention,
-per-tenant quotas, persistent object lifecycle policies and signed read
-access policies are already implemented.
+per-tenant quotas, persistent object lifecycle policies, signed read
+access policies and per-tenant rate limiting are already implemented.
 
 ## Requirements
 
@@ -450,6 +450,57 @@ return `403 {"error":"access denied"}`, a valid signature on an unknown key
 or version still returns `404`, and successful responses keep their `ETag`
 and `X-Content-Sha256` headers.
 
+### Per-tenant rate limiting
+
+Each tenant may carry a rate limit policy, persisted atomically with the
+index. The policy holds a required `window_seconds` — an integer from 1 to
+86400 — and at least one of `max_requests` and `max_bytes`, both
+non-negative integers; booleans, negative numbers, a missing window, a
+policy without any limit or, over HTTP, unknown fields all raise
+`ObjectStoreError("invalid rate limit")` / return
+`400 {"error":"invalid rate limit"}`:
+
+```python
+store.set_rate_limit(60, max_requests=100, max_bytes=1_000_000, tenant="acme")
+store.get_rate_limit(tenant="acme")
+# -> {"window_seconds": 60, "max_requests": 100, "max_bytes": 1000000} or None
+store.get_rate_limit_usage(tenant="acme")
+# -> {"window_start": <int>, "reset_at": <int>, "requests": <int>, "bytes": <int>}
+#    or None while no policy is saved
+store.clear_rate_limit(tenant="acme")   # back to unlimited (a no-op when unset)
+```
+
+While a policy is saved, every object, blob, upload, version, retention,
+quota, lifecycle and access-policy operation of that tenant — through the
+Python API or HTTP — is charged one request against a fixed UTC Unix
+window (`window_start = now - now % window_seconds`); `put` payloads and
+upload chunks additionally charge their body bytes against `max_bytes`
+(metadata JSON such as the session declaration never counts). Tenant,
+framing, signature and condition-header validation runs first and failed
+validation is never charged; a request that passes validation is checked
+and recorded atomically under the store lock before any state change, so
+concurrent callers can never push a window over its limit. A rejected
+request raises `ObjectStoreError("rate limit exceeded")` (HTTP
+`429 {"error":"rate limit exceeded"}` with a `Retry-After` header holding
+the seconds left in the window, at least 1) and changes neither storage
+nor counters. Rolling into the next window resets the counters to zero.
+The policy survives reopening the data directory while the counters live
+in memory only and restart from zero for the current window; a
+persistence failure raises `ObjectStoreError("rate limit io error")`
+(HTTP `500`) with the previous policy kept. Tenants without a saved
+policy — and the `/healthz` and rate-limit management endpoints
+themselves — see no behaviour change.
+
+The HTTP surface grows two tenant-scoped endpoints (tenant selected
+through `X-Objstore-Tenant` as usual): `GET /v1/rate-limit` returns the
+saved policy or `null`, `PUT /v1/rate-limit` saves a policy from a JSON
+object holding `window_seconds` and at least one of `max_requests` and
+`max_bytes` (and returns the saved policy), `DELETE /v1/rate-limit`
+clears the policy and returns `null`, and `GET /v1/rate-limit/usage`
+returns the current window's `{"window_start","reset_at","requests","bytes"}`
+or `null` while no policy is saved. The command line interface is
+unchanged by this feature.
+
 
 ## Tests
 
@@ -528,6 +579,10 @@ checks.
 | GET | `/v1/access-policy` | 200 `{"mode": "public"|"signed"}` for the selected tenant | 400 invalid tenant, 405 |
 | PUT | `/v1/access-policy` | 200 `{"mode": ...}`; body is a JSON object with `mode` (`public`/`signed`) and, for `signed`, a 16–256 character UTF-8 `secret` | 400 invalid access policy, 405, 411, 500 access policy io error |
 | DELETE | `/v1/access-policy` | 200 `{"mode": "public"}`; restores public reads | 400 invalid tenant, 405, 500 access policy io error |
+| GET | `/v1/rate-limit` | 200 `{"window_seconds": <int>, "max_requests": <int|null>, "max_bytes": <int|null>}` or `null` for the selected tenant | 400 invalid tenant, 405 |
+| PUT | `/v1/rate-limit` | 200 with the saved policy; body holds a 1–86400 integer `window_seconds` plus at least one of the non-negative integer limits, and no unknown fields | 400 invalid rate limit, 405, 411, 500 rate limit io error |
+| DELETE | `/v1/rate-limit` | 200 `null`; clears the policy (idempotent) | 400 invalid tenant, 405, 500 rate limit io error |
+| GET | `/v1/rate-limit/usage` | 200 `{"window_start","reset_at","requests","bytes"}` for the current window, or `null` while no policy is saved | 400 invalid tenant, 405 |
 
 Notes:
 
@@ -591,6 +646,8 @@ Upload session notes:
                         #  "quota":{"<tenant>":{"max_bytes"?,"max_objects"?}},
                         #  "lifecycle":{"<tenant>":{"prefix","max_age_seconds"}},
                         #  "access":{"<tenant>":{"mode":"signed","secret"}}
+                        #  "rate_limit":{"<tenant>":{"window_seconds",
+                        #  "max_requests"?,"max_bytes"?}}
                         #  (only tenants with a saved policy)}
   blobs/<sha256>        # raw object bytes, one file per distinct digest
   uploads/<session>.json  # active upload declaration plus confirmed offset, tenant
@@ -609,15 +666,16 @@ every tenant starts unlimited. Indexes written before lifecycle existed have
 no `lifecycle` map and their entries lack `last_modified`; those directories
 open unchanged and the timeless entries are never expired by a lifecycle
 run. Indexes written before access policies existed have no `access` map, so
-every tenant starts public.
+every tenant starts public. Indexes written before rate limiting existed
+have no `rate_limit` map, so every tenant starts unlimited.
 
 ## Limits of this seed
 
 The following long-term goals are intentionally not implemented yet:
-rate limiting, consistent hashing and rebalancing, erasure coding and
+consistent hashing and rebalancing, erasure coding and
 repair, cross-region replication and end-to-end audit logging. Resumable
 uploads are exposed through the
 Python API and the HTTP surface; the command line interface does not
 expose them yet, and likewise exposes no versioning, retention, quota,
-lifecycle or access-policy commands.
+lifecycle, access-policy or rate-limit commands.
 Authentication is out of scope: the server trusts every caller.
