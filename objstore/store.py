@@ -69,6 +69,20 @@ HMAC-SHA256 of the tenant, HTTP method, key, optional version id and
 expires, joined by newlines, keyed with the secret); :meth:`sign_request`
 computes exactly that signature. The check runs before any key or version
 lookup and fails with ``ObjectStoreError("access denied")``.
+
+Each tenant may also carry a rate limit policy (``rate_limit`` map in the
+index) with a required ``window_seconds`` (1 to 86400) and at least one of
+``max_requests`` and ``max_bytes`` (non-negative integers, booleans
+excluded). While a policy is saved, every object, blob, upload, version,
+retention, quota, lifecycle and access-policy operation on that tenant is
+admitted only after an atomic check against fixed UTC windows aligned to
+the Unix epoch: one request per operation, plus the payload bytes of
+``put`` and ``append_upload`` against ``max_bytes``. A rejected operation
+raises :class:`RateLimitExceeded` (an ``ObjectStoreError`` reading "rate
+limit exceeded") before any state changes and is not itself counted;
+counters live in memory only, so reopening the data directory keeps the
+policy but starts the current window from zero. Tenants without a saved
+policy are unlimited and see no behaviour change.
 """
 
 from __future__ import annotations
@@ -84,7 +98,8 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
-__all__ = ["ContentAddressedStore", "ObjectStoreError", "SessionConflict"]
+__all__ = ["ContentAddressedStore", "ObjectStoreError", "RateLimitExceeded",
+           "SessionConflict"]
 
 INDEX_NAME = "index.json"
 BLOBS_DIRNAME = "blobs"
@@ -112,6 +127,21 @@ class SessionConflict(ObjectStoreError):
     catching it; front ends (HTTP) can nevertheless distinguish these
     state conflicts from bad input and report them separately.
     """
+
+
+class RateLimitExceeded(ObjectStoreError):
+    """A request rejected by the tenant's rate limit policy.
+
+    A subclass of :class:`ObjectStoreError` (its message reads exactly
+    "rate limit exceeded"), so existing callers keep catching it; front
+    ends can distinguish it and emit a 429 with a ``Retry-After`` header
+    taken from :attr:`retry_after` (seconds until the current window
+    resets, always at least 1).
+    """
+
+    def __init__(self, retry_after=1):
+        super().__init__("rate limit exceeded")
+        self.retry_after = max(1, int(retry_after))
 
 
 def _is_sha256(value):
@@ -149,13 +179,15 @@ class ContentAddressedStore:
         os.makedirs(self.blobs_dir, exist_ok=True)
         (self._objects, self._timestamps, self._upload_records,
          self._versioning, self._versions, self._retention, self._quota,
-         self._lifecycle, self._access) = self._load_index()
+         self._lifecycle, self._access, self._rate_limit) = self._load_index()
         self._uploads = self._load_uploads()
+        # In-memory fixed-window counters per tenant; never persisted.
+        self._rate_windows = {}
 
     # -- index ---------------------------------------------------------
     def _load_index(self):
         if not os.path.exists(self.index_path):
-            return {DEFAULT_TENANT: {}}, {}, {}, {}, {}, {}, {}, {}, {}
+            return {DEFAULT_TENANT: {}}, {}, {}, {}, {}, {}, {}, {}, {}, {}
         try:
             with open(self.index_path, "rb") as handle:
                 document = json.loads(handle.read().decode("utf-8"))
@@ -266,8 +298,16 @@ class ContentAddressedStore:
             if not isinstance(tenant, str) or _TENANT_RE.match(tenant) is None:
                 raise ObjectStoreError("corrupted index: bad access tenant")
             access[tenant] = self._validate_access_policy(policy)
+        rate_limit = {}
+        raw_rate_limit = document.get("rate_limit", {})
+        if not isinstance(raw_rate_limit, dict):
+            raise ObjectStoreError("corrupted index: rate_limit is not a map")
+        for tenant, policy in raw_rate_limit.items():
+            if not isinstance(tenant, str) or _TENANT_RE.match(tenant) is None:
+                raise ObjectStoreError("corrupted index: bad rate limit tenant")
+            rate_limit[tenant] = self._validate_rate_limit_policy(policy)
         return (objects, timestamps, records, versioning, versions,
-                retention, quota, lifecycle, access)
+                retention, quota, lifecycle, access, rate_limit)
 
     def _load_object_map(self, mapping):
         objects, timestamps = {}, {}
@@ -382,6 +422,26 @@ class ContentAddressedStore:
         return {"mode": "signed", "secret": secret}
 
     @staticmethod
+    def _validate_rate_limit_policy(policy):
+        if not isinstance(policy, dict):
+            raise ObjectStoreError("corrupted index: bad rate limit policy")
+        window = policy.get("window_seconds")
+        if isinstance(window, bool) or not isinstance(window, int) \
+                or not 1 <= window <= 86400:
+            raise ObjectStoreError("corrupted index: bad rate limit policy")
+        loaded = {"window_seconds": window}
+        for name in ("max_requests", "max_bytes"):
+            value = policy.get(name)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ObjectStoreError("corrupted index: bad rate limit policy")
+            loaded[name] = value
+        if len(loaded) == 1:
+            raise ObjectStoreError("corrupted index: bad rate limit policy")
+        return loaded
+
+    @staticmethod
     def _stored_entry(entry, last_modified):
         """Return the on-disk form of *entry*, adding *last_modified* when set."""
         saved = dict(entry)
@@ -431,6 +491,8 @@ class ContentAddressedStore:
             document["lifecycle"] = self._lifecycle
         if self._access:
             document["access"] = self._access
+        if self._rate_limit:
+            document["rate_limit"] = self._rate_limit
         payload = json.dumps(document, sort_keys=True, separators=(",", ":"))
         _atomic_write(self.index_path, payload.encode("utf-8") + b"\n")
 
@@ -521,6 +583,7 @@ class ContentAddressedStore:
             if expected is not _MISSING and not self._precondition_met(
                     tenant, key, expected):
                 raise ObjectStoreError("precondition failed")
+            self._rate_limit_check(tenant, len(data))
             versioning_on = self._versioning.get(tenant, False)
             delta_bytes, delta_objects = self._publish_delta(
                 tenant, key, entry, versioning_on)
@@ -602,8 +665,9 @@ class ContentAddressedStore:
         with self._lock:
             self._check_read_access(tenant, key, None, expires, signature,
                                     "GET")
+            self._rate_limit_check(tenant)
             entry = self._head_unlocked(tenant, key)
-            data = self.blob(entry["sha256"])
+            data = self._blob_unlocked(entry["sha256"])
             if len(data) != entry["size"]:
                 raise ObjectStoreError("corrupted blob")
             return data, entry
@@ -619,6 +683,19 @@ class ContentAddressedStore:
         with self._lock:
             self._check_read_access(tenant, key, None, expires, signature,
                                     "HEAD")
+            self._rate_limit_check(tenant)
+            return self._head_unlocked(tenant, key)
+
+    def _peek_head(self, tenant, key):
+        """Return *key*'s entry the way :meth:`head` does, uncounted.
+
+        Used internally (e.g. by the HTTP front end's pre-write check) so
+        one logical request is accounted exactly once. Raises ``access
+        denied`` for signed tenants exactly like a signature-less
+        :meth:`head`.
+        """
+        with self._lock:
+            self._check_read_access(tenant, key, None, None, None, "HEAD")
             return self._head_unlocked(tenant, key)
 
     def _head_unlocked(self, tenant, key):
@@ -651,6 +728,7 @@ class ContentAddressedStore:
             if expected is not _MISSING and not self._precondition_met(
                     tenant, key, expected):
                 raise ObjectStoreError("precondition failed")
+            self._rate_limit_check(tenant)
             self._remove_current_unlocked(tenant, key)
             self._save_index()
 
@@ -694,25 +772,34 @@ class ContentAddressedStore:
         if not keymap:
             del self._versions[tenant]
 
-    def blob(self, sha256):
+    def blob(self, sha256, tenant=DEFAULT_TENANT):
         """Return the raw bytes stored under digest *sha256*.
 
         The digest of the bytes actually on disk is recomputed on every read,
         so truncation, appended bytes and same-length tampering are all
         rejected instead of being handed back to the caller.
+
+        Blobs stay global; *tenant* only selects the rate limit policy the
+        read is accounted against (the default tenant when omitted).
         """
         self._require_sha(sha256)
+        self._check_tenant(tenant)
         with self._lock:
-            try:
-                with open(os.path.join(self.blobs_dir, sha256), "rb") as handle:
-                    data = handle.read()
-            except FileNotFoundError:
-                raise ObjectStoreError("not found: blob %s" % (sha256,))
-            except OSError:
-                raise ObjectStoreError("blob io error")
-            if hashlib.sha256(data).hexdigest() != sha256:
-                raise ObjectStoreError("corrupted blob")
-            return data
+            self._rate_limit_check(tenant)
+            return self._blob_unlocked(sha256)
+
+    def _blob_unlocked(self, sha256):
+        """Return the verified bytes of *sha256*; must be called under the lock."""
+        try:
+            with open(os.path.join(self.blobs_dir, sha256), "rb") as handle:
+                data = handle.read()
+        except FileNotFoundError:
+            raise ObjectStoreError("not found: blob %s" % (sha256,))
+        except OSError:
+            raise ObjectStoreError("blob io error")
+        if hashlib.sha256(data).hexdigest() != sha256:
+            raise ObjectStoreError("corrupted blob")
+        return data
 
     def blob_digests(self):
         """Return the sorted digests currently present in the blob directory."""
@@ -935,6 +1022,7 @@ class ContentAddressedStore:
                    "content_type": content_type, "offset": 0,
                    "expected_sha256": expected, "tenant": tenant}
         with self._lock:
+            self._rate_limit_check(tenant)
             self._enforce_reservation(tenant, size)
             session_id = self._new_session_id()
             try:
@@ -961,6 +1049,7 @@ class ContentAddressedStore:
         self._check_tenant(tenant)
         self._check_session_id(session_id)
         with self._lock:
+            self._rate_limit_check(tenant)
             record = self._upload_records.get(session_id)
             if record is not None:
                 if record["tenant"] != tenant:
@@ -997,6 +1086,7 @@ class ContentAddressedStore:
         data = bytes(payload)
         with self._lock:
             session = self._require_active_session(session_id, tenant)
+            self._rate_limit_check(tenant, len(data))
             current = session["offset"]
             if offset > current:
                 raise SessionConflict(
@@ -1064,6 +1154,7 @@ class ContentAddressedStore:
             if expected is not _MISSING and not self._precondition_met(
                     tenant, session["key"], expected):
                 raise ObjectStoreError("precondition failed")
+            self._rate_limit_check(tenant)
             entry = {"sha256": session["sha256"], "size": session["size"],
                      "content_type": session["content_type"]}
             # The session's own reservation is lifted before the quota check:
@@ -1117,6 +1208,7 @@ class ContentAddressedStore:
         self._check_tenant(tenant)
         self._check_session_id(session_id)
         with self._lock:
+            self._rate_limit_check(tenant)
             record = self._upload_records.get(session_id)
             if record is not None:
                 if record["tenant"] != tenant:
@@ -1224,6 +1316,7 @@ class ContentAddressedStore:
             raise ObjectStoreError("invalid after: %r" % (after,))
         limit = self._check_limit(limit)
         with self._lock:
+            self._rate_limit_check(tenant)
             objects = self._objects.get(tenant, {})
             keys = sorted(key for key in objects if key.startswith(prefix))
             if after:
@@ -1253,6 +1346,7 @@ class ContentAddressedStore:
         if not isinstance(enabled, bool):
             raise ObjectStoreError("invalid versioning")
         with self._lock:
+            self._rate_limit_check(tenant)
             if enabled:
                 self._versioning[tenant] = True
             else:
@@ -1263,6 +1357,7 @@ class ContentAddressedStore:
         """Return whether *tenant* currently has versioning enabled."""
         self._check_tenant(tenant)
         with self._lock:
+            self._rate_limit_check(tenant)
             return bool(self._versioning.get(tenant, False))
 
     def _require_versioning(self, tenant):
@@ -1308,6 +1403,7 @@ class ContentAddressedStore:
             raise ObjectStoreError("invalid version")
         limit = self._check_limit(limit)
         with self._lock:
+            self._rate_limit_check(tenant)
             self._require_versioning(tenant)
             versions = self._versions_of(tenant, key)
             current_id = versions[-1]["version_id"]
@@ -1342,6 +1438,7 @@ class ContentAddressedStore:
         with self._lock:
             self._check_read_access(tenant, key, version_id, expires,
                                     signature, "HEAD")
+            self._rate_limit_check(tenant)
             self._require_versioning(tenant)
             self._check_version_id(version_id)
             return self._head_version_unlocked(tenant, key, version_id)
@@ -1370,10 +1467,11 @@ class ContentAddressedStore:
         with self._lock:
             self._check_read_access(tenant, key, version_id, expires,
                                     signature, "GET")
+            self._rate_limit_check(tenant)
             self._require_versioning(tenant)
             self._check_version_id(version_id)
             entry = self._head_version_unlocked(tenant, key, version_id)
-            data = self.blob(entry["sha256"])
+            data = self._blob_unlocked(entry["sha256"])
             if len(data) != entry["size"]:
                 raise ObjectStoreError("corrupted blob")
             return data, entry
@@ -1389,6 +1487,7 @@ class ContentAddressedStore:
         self._check_tenant(tenant)
         self._check_key(key)
         with self._lock:
+            self._rate_limit_check(tenant)
             self._require_versioning(tenant)
             self._check_version_id(version_id)
             versions = self._versions_of(tenant, key)
@@ -1438,6 +1537,7 @@ class ContentAddressedStore:
         if max_age_seconds is not None:
             policy["max_age_seconds"] = max_age_seconds
         with self._lock:
+            self._rate_limit_check(tenant)
             self._retention[tenant] = policy
             self._save_index()
 
@@ -1449,6 +1549,7 @@ class ContentAddressedStore:
         """
         self._check_tenant(tenant)
         with self._lock:
+            self._rate_limit_check(tenant)
             policy = self._retention.get(tenant)
             if policy is None:
                 return None
@@ -1471,6 +1572,7 @@ class ContentAddressedStore:
         if not isinstance(dry_run, bool):
             raise ObjectStoreError("invalid dry_run")
         with self._lock:
+            self._rate_limit_check(tenant)
             policy = self._retention.get(tenant)
             if policy is None:
                 return {"versions": [], "bytes": 0, "dry_run": dry_run}
@@ -1657,6 +1759,7 @@ class ContentAddressedStore:
         if max_objects is not None:
             policy["max_objects"] = max_objects
         with self._lock:
+            self._rate_limit_check(tenant)
             previous = self._quota.get(tenant)
             self._quota[tenant] = policy
             try:
@@ -1676,6 +1779,7 @@ class ContentAddressedStore:
         """
         self._check_tenant(tenant)
         with self._lock:
+            self._rate_limit_check(tenant)
             policy = self._quota.get(tenant)
             if policy is None:
                 return None
@@ -1691,6 +1795,7 @@ class ContentAddressedStore:
         """
         self._check_tenant(tenant)
         with self._lock:
+            self._rate_limit_check(tenant)
             previous = self._quota.pop(tenant, None)
             try:
                 self._save_index()
@@ -1711,6 +1816,7 @@ class ContentAddressedStore:
         """
         self._check_tenant(tenant)
         with self._lock:
+            self._rate_limit_check(tenant)
             return self._usage_unlocked(tenant)
 
     # -- lifecycle -------------------------------------------------------
@@ -1729,6 +1835,7 @@ class ContentAddressedStore:
         self._check_tenant(tenant)
         policy = self._check_lifecycle_values(prefix, max_age_seconds)
         with self._lock:
+            self._rate_limit_check(tenant)
             previous = self._lifecycle.get(tenant)
             self._lifecycle[tenant] = policy
             try:
@@ -1754,6 +1861,7 @@ class ContentAddressedStore:
         """Return *tenant*'s lifecycle policy, or None when none is saved."""
         self._check_tenant(tenant)
         with self._lock:
+            self._rate_limit_check(tenant)
             policy = self._lifecycle.get(tenant)
             if policy is None:
                 return None
@@ -1769,6 +1877,7 @@ class ContentAddressedStore:
         """
         self._check_tenant(tenant)
         with self._lock:
+            self._rate_limit_check(tenant)
             previous = self._lifecycle.pop(tenant, None)
             try:
                 self._save_index()
@@ -1811,6 +1920,7 @@ class ContentAddressedStore:
         if not isinstance(dry_run, bool):
             raise ObjectStoreError("invalid dry_run")
         with self._lock:
+            self._rate_limit_check(tenant)
             policy = self._lifecycle.get(tenant)
             if policy is None:
                 return {"objects": [], "bytes": 0, "dry_run": dry_run}
@@ -1876,6 +1986,7 @@ class ContentAddressedStore:
         """
         self._check_tenant(tenant)
         with self._lock:
+            self._rate_limit_check(tenant)
             policy = self._access.get(tenant)
             if policy is None:
                 return {"mode": "public"}
@@ -1900,6 +2011,7 @@ class ContentAddressedStore:
             raise ObjectStoreError("invalid access policy")
         secret = self._check_secret(secret, "invalid access policy")
         with self._lock:
+            self._rate_limit_check(tenant)
             previous = self._access.get(tenant, _MISSING)
             self._access[tenant] = {"mode": "signed", "secret": secret}
             try:
@@ -1920,6 +2032,7 @@ class ContentAddressedStore:
         """
         self._check_tenant(tenant)
         with self._lock:
+            self._rate_limit_check(tenant)
             previous = self._access.pop(tenant, None)
             try:
                 self._save_index()
@@ -1980,3 +2093,145 @@ class ContentAddressedStore:
                                           key, version_id, expires)
         if not hmac.compare_digest(signature, expected):
             raise ObjectStoreError("access denied")
+
+    def _access_mode(self, tenant):
+        """Return ``"public"``/``"signed"`` without rate-limit accounting.
+
+        Used internally by front ends that need the mode to prepare a
+        request; the request itself is accounted by the operation it ends
+        up calling.
+        """
+        with self._lock:
+            return "signed" if self._access.get(tenant) is not None else "public"
+
+    # -- rate limiting ---------------------------------------------------
+    def _rate_limit_check(self, tenant, body_bytes=0):
+        """Admit and account one request against *tenant*'s rate limit.
+
+        Must be called under the store lock, after tenant, framing,
+        signature and precondition validation and before any state change
+        or response. The window is fixed and aligned to the Unix epoch:
+        counters reset whenever the window changes. A permitted request is
+        accounted immediately (one request plus *body_bytes* against
+        ``max_bytes``); a rejected one raises :class:`RateLimitExceeded`
+        without touching storage or the counters. Tenants without a saved
+        policy are unlimited.
+        """
+        policy = self._rate_limit.get(tenant)
+        if policy is None:
+            return
+        now = int(time.time())
+        window = policy["window_seconds"]
+        window_start = (now // window) * window
+        state = self._rate_windows.get(tenant)
+        if state is None or state["window_start"] != window_start:
+            state = self._rate_windows[tenant] = {
+                "window_start": window_start, "requests": 0, "bytes": 0}
+        max_requests = policy.get("max_requests")
+        max_bytes = policy.get("max_bytes")
+        if max_requests is not None and state["requests"] + 1 > max_requests \
+                or max_bytes is not None and state["bytes"] + body_bytes > max_bytes:
+            raise RateLimitExceeded(window_start + window - now)
+        state["requests"] += 1
+        state["bytes"] += body_bytes
+
+    def set_rate_limit(self, window_seconds, max_requests=None, max_bytes=None,
+                       tenant=DEFAULT_TENANT):
+        """Save *tenant*'s rate limit policy.
+
+        *window_seconds* is required and must be an integer between 1 and
+        86400 (booleans excluded); at least one of *max_requests* and
+        *max_bytes* must be given as a non-negative integer (booleans
+        excluded). Anything else raises ``ObjectStoreError("invalid rate
+        limit")``. The policy is persisted with the index; an I/O failure
+        while saving raises ``ObjectStoreError("rate limit io error")``
+        and keeps the previous policy. The counters of the current window
+        are kept; a window switch always resets them.
+        """
+        self._check_tenant(tenant)
+        if isinstance(window_seconds, bool) \
+                or not isinstance(window_seconds, int) \
+                or not 1 <= window_seconds <= 86400:
+            raise ObjectStoreError("invalid rate limit")
+        for value in (max_requests, max_bytes):
+            if value is not None and (isinstance(value, bool)
+                                      or not isinstance(value, int)
+                                      or value < 0):
+                raise ObjectStoreError("invalid rate limit")
+        if max_requests is None and max_bytes is None:
+            raise ObjectStoreError("invalid rate limit")
+        policy = {"window_seconds": window_seconds}
+        if max_requests is not None:
+            policy["max_requests"] = max_requests
+        if max_bytes is not None:
+            policy["max_bytes"] = max_bytes
+        with self._lock:
+            previous = self._rate_limit.get(tenant)
+            self._rate_limit[tenant] = policy
+            try:
+                self._save_index()
+            except OSError:
+                if previous is None:
+                    del self._rate_limit[tenant]
+                else:
+                    self._rate_limit[tenant] = previous
+                raise ObjectStoreError("rate limit io error")
+
+    def get_rate_limit(self, tenant=DEFAULT_TENANT):
+        """Return *tenant*'s rate limit policy, or None when none is saved.
+
+        A saved policy is returned as a dict with ``window_seconds``,
+        ``max_requests`` and ``max_bytes`` keys, unset limits reading as
+        None.
+        """
+        self._check_tenant(tenant)
+        with self._lock:
+            policy = self._rate_limit.get(tenant)
+            if policy is None:
+                return None
+            return {"window_seconds": policy["window_seconds"],
+                    "max_requests": policy.get("max_requests"),
+                    "max_bytes": policy.get("max_bytes")}
+
+    def clear_rate_limit(self, tenant=DEFAULT_TENANT):
+        """Drop *tenant*'s rate limit policy and return None.
+
+        Clearing a tenant without a policy is a no-op. An I/O failure
+        while saving raises ``ObjectStoreError("rate limit io error")``
+        and keeps the previous policy.
+        """
+        self._check_tenant(tenant)
+        with self._lock:
+            previous = self._rate_limit.pop(tenant, None)
+            try:
+                self._save_index()
+            except OSError:
+                if previous is not None:
+                    self._rate_limit[tenant] = previous
+                raise ObjectStoreError("rate limit io error")
+
+    def get_rate_limit_usage(self, tenant=DEFAULT_TENANT):
+        """Return *tenant*'s current-window counters, or None without a policy.
+
+        The result holds ``window_start`` and ``reset_at`` (integer Unix
+        seconds bounding the current fixed window) plus the ``requests``
+        and ``bytes`` accounted so far in it. Counters live in memory
+        only: after a restart they start at zero for the current window.
+        """
+        self._check_tenant(tenant)
+        with self._lock:
+            policy = self._rate_limit.get(tenant)
+            if policy is None:
+                return None
+            now = int(time.time())
+            window = policy["window_seconds"]
+            window_start = (now // window) * window
+            state = self._rate_windows.get(tenant)
+            requests = bytes_used = 0
+            if state is not None and state["window_start"] == window_start:
+                requests = state["requests"]
+                bytes_used = state["bytes"]
+            return {"window_start": window_start,
+                    "reset_at": window_start + window,
+                    "requests": requests,
+                    "bytes": bytes_used}

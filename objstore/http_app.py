@@ -18,6 +18,17 @@ requests must carry ``expires`` and ``signature`` query parameters holding
 an unexpired signature of the request; missing, repeated, malformed,
 expired or mismatching parameters are a 403, while a valid signature on an
 unknown key or version still gets the plain 404.
+
+The rate-limit endpoints (``/v1/rate-limit`` and ``/v1/rate-limit/usage``)
+are tenant-scoped the same way and manage the tenant's fixed-window
+request policy; they and ``/healthz`` are the only requests never counted.
+Every other request is admitted atomically against the selected tenant's
+saved policy after tenant, framing, signature and precondition validation;
+a rejected request gets ``429 {"error":"rate limit exceeded"}`` with a
+``Retry-After`` header holding the seconds left in the current window and
+changes neither storage nor counters. The blob endpoint stays global: an
+absent or invalid tenant header never fails it, the request is simply
+accounted against the default tenant.
 """
 
 from __future__ import annotations
@@ -33,6 +44,7 @@ from .store import (
     DEFAULT_TENANT,
     ContentAddressedStore,
     ObjectStoreError,
+    RateLimitExceeded,
     SessionConflict,
     _MISSING,
 )
@@ -52,6 +64,8 @@ _USAGE_PATH = "/v1/usage"
 _LIFECYCLE_PATH = "/v1/lifecycle"
 _LIFECYCLE_RUN_PATH = "/v1/lifecycle/run"
 _ACCESS_POLICY_PATH = "/v1/access-policy"
+_RATE_LIMIT_PATH = "/v1/rate-limit"
+_RATE_LIMIT_USAGE_PATH = "/v1/rate-limit/usage"
 _TENANT_HEADER = "X-Objstore-Tenant"
 _DEFAULT_CONTENT_TYPE = "application/octet-stream"
 _DECIMAL_RE = re.compile(r"\A[0-9]+\Z")
@@ -60,12 +74,13 @@ _BAD_REQUEST_PREFIXES = (
     "invalid after", "invalid size", "invalid offset", "invalid json",
     "invalid precondition", "invalid tenant", "invalid version",
     "invalid retention", "invalid dry_run", "invalid quota",
-    "invalid lifecycle", "invalid access policy", "versioning disabled",
+    "invalid lifecycle", "invalid access policy", "invalid rate limit",
+    "versioning disabled",
     "payload", "content_type",
 )
 _INTERNAL_ERRORS = ("corrupted blob", "blob io error", "upload io error",
                     "version io error", "quota io error", "lifecycle io error",
-                    "access policy io error")
+                    "access policy io error", "rate limit io error")
 
 
 def _json_bytes(payload):
@@ -79,6 +94,8 @@ def _status_for(message):
         return 412
     if message == "quota exceeded":
         return 413
+    if message == "rate limit exceeded":
+        return 429
     if message == "access denied":
         return 403
     for prefix in _BAD_REQUEST_PREFIXES:
@@ -109,11 +126,12 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
         if body and not head_only and status != 204:
             self.wfile.write(body)
 
-    def _error(self, status, message, close=False):
-        extra = [("Connection", "close")] if close else ()
+    def _error(self, status, message, close=False, extra_headers=()):
+        headers = [("Connection", "close")] if close else []
+        headers.extend(extra_headers)
         if close:
             self.close_connection = True
-        self._send(status, _json_bytes({"error": message}), extra_headers=extra)
+        self._send(status, _json_bytes({"error": message}), extra_headers=headers)
 
     def _read_body(self):
         raw = self.headers.get("Content-Length")
@@ -229,6 +247,14 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
                 return self._run_lifecycle(tenant)
             if path == _ACCESS_POLICY_PATH:
                 return self._access_policy(method, self._tenant())
+            if path == _RATE_LIMIT_PATH:
+                return self._rate_limit(method, self._tenant())
+            if path == _RATE_LIMIT_USAGE_PATH:
+                tenant = self._tenant()
+                if method != "GET":
+                    return self._error(405, "method not allowed")
+                return self._send(200, _json_bytes(
+                    self.server.store.get_rate_limit_usage(tenant=tenant)))
             if path.startswith(_OBJECTS_PATH + "/"):
                 return self._object(method, unquote(path[len(_OBJECTS_PATH) + 1:]),
                                     parsed.query)
@@ -250,6 +276,9 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
                     return self._error(405, "method not allowed")
                 return self._blob(unquote(path[len(_BLOBS_PATH) + 1:]))
             return self._error(404, "not found")
+        except RateLimitExceeded as exc:
+            return self._error(429, str(exc), extra_headers=(
+                ("Retry-After", str(exc.retry_after)),))
         except SessionConflict as exc:
             return self._error(409, str(exc))
         except ObjectStoreError as exc:
@@ -293,7 +322,10 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
             ContentAddressedStore._check_key(key)
             expected = self._precondition_headers()
             try:
-                existing = store.head(key, tenant=tenant)
+                # Peek without accounting: the PUT itself is the request
+                # that counts, so the pre-write existence check must not
+                # consume the tenant's rate limit budget.
+                existing = store._peek_head(tenant, key)
             except ObjectStoreError:
                 existing = None
             entry = store.put(key, body, content_type=self.headers.get("Content-Type"),
@@ -664,7 +696,7 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
         or malformed parameters are an ``access denied`` error raised
         before any object or version is looked up.
         """
-        if self.server.store.get_access_policy(tenant=tenant)["mode"] != "signed":
+        if self.server.store._access_mode(tenant) != "signed":
             return {}
         params = parse_qs(query, keep_blank_values=True)
         expires = params.get("expires")
@@ -679,8 +711,58 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
     def _blob(self, sha256):
         if _SHA256_RE.match(sha256) is None:
             raise ObjectStoreError("invalid sha256: %r" % (sha256,))
-        return self._send(200, self.server.store.blob(sha256), _DEFAULT_CONTENT_TYPE,
-                          [("X-Content-Sha256", sha256)])
+        return self._send(200, self.server.store.blob(
+            sha256, tenant=self._accounting_tenant()), _DEFAULT_CONTENT_TYPE,
+            [("X-Content-Sha256", sha256)])
+
+    def _accounting_tenant(self):
+        """Return the tenant a global (blob) request is accounted against.
+
+        The blob endpoint stays global: an absent, repeated or invalid
+        ``X-Objstore-Tenant`` header never fails the request, it simply
+        accounts against the default tenant.
+        """
+        values = self.headers.get_all(_TENANT_HEADER) or []
+        if len(values) != 1:
+            return DEFAULT_TENANT
+        try:
+            return ContentAddressedStore._check_tenant(values[0])
+        except ObjectStoreError:
+            return DEFAULT_TENANT
+
+    # -- rate limiting ----------------------------------------------------
+    def _rate_limit(self, method, tenant):
+        store = self.server.store
+        if method == "GET":
+            return self._send(200, _json_bytes(store.get_rate_limit(tenant=tenant)))
+        if method == "DELETE":
+            store.clear_rate_limit(tenant=tenant)
+            return self._send(200, _json_bytes(None))
+        if method != "PUT":
+            return self._error(405, "method not allowed")
+        body, error = self._read_length_body()
+        if error is not None:
+            return self._error(*error)
+        # Every body problem -- unparseable JSON, a non-object document,
+        # unknown fields, a missing window or no limit at all -- is the
+        # same 400 here.
+        try:
+            document = self._json_object(body)
+        except ObjectStoreError:
+            raise ObjectStoreError("invalid rate limit")
+        if set(document) - {"window_seconds", "max_requests", "max_bytes"}:
+            raise ObjectStoreError("invalid rate limit")
+        if "window_seconds" not in document:
+            raise ObjectStoreError("invalid rate limit")
+        store.set_rate_limit(document.get("window_seconds"),
+                             max_requests=document.get("max_requests"),
+                             max_bytes=document.get("max_bytes"),
+                             tenant=tenant)
+        return self._send(200, _json_bytes({
+            "window_seconds": document.get("window_seconds"),
+            "max_requests": document.get("max_requests"),
+            "max_bytes": document.get("max_bytes"),
+        }))
 
 
 class ObjectStoreHTTPServer(ThreadingHTTPServer):

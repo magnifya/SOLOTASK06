@@ -15,8 +15,9 @@ collection, metadata indexing and listing, quotas and rate limiting, consistent
 hashing and rebalancing, erasure coding and repair, signed URLs and access
 control, cross-region replication and end-to-end audit. Multi-tenant namespaces,
 conditional writes, resumable uploads, object versioning with retention,
-per-tenant quotas, persistent object lifecycle policies and signed read
-access policies are already implemented.
+per-tenant quotas, persistent object lifecycle policies, signed read
+access policies and per-tenant fixed-window rate limiting are already
+implemented.
 
 ## Requirements
 
@@ -450,6 +451,59 @@ return `403 {"error":"access denied"}`, a valid signature on an unknown key
 or version still returns `404`, and successful responses keep their `ETag`
 and `X-Content-Sha256` headers.
 
+### Tenant rate limiting
+
+Each tenant may carry a rate limit policy, persisted atomically with the
+index. The policy requires `window_seconds` (an integer between 1 and
+86400, booleans excluded) plus at least one of `max_requests` and
+`max_bytes` (non-negative integers, booleans excluded); anything else —
+booleans, negatives, unknown fields, a missing window or no limit at all —
+raises `ObjectStoreError("invalid rate limit")` / returns
+`400 {"error":"invalid rate limit"}`:
+
+```python
+store.set_rate_limit(60, max_requests=100, tenant="acme")
+store.set_rate_limit(3600, max_requests=1000, max_bytes=10_000_000, tenant="acme")
+store.get_rate_limit(tenant="acme")
+# -> {"window_seconds":..., "max_requests":..., "max_bytes":...} or None
+store.clear_rate_limit(tenant="acme")   # back to unlimited
+store.get_rate_limit_usage(tenant="acme")
+# -> {"window_start": <int>, "reset_at": <int>,
+#     "requests": <int>, "bytes": <int>} or None
+```
+
+While a policy is saved, every object, blob, upload, version, retention,
+quota, lifecycle and access-policy operation on that tenant counts once
+against `max_requests`, and the payload bytes of `put` and
+`append_upload` (never metadata JSON) count against `max_bytes`. The
+counters live in fixed UTC windows aligned to the Unix epoch: they reset
+whenever the window changes, and they live in memory only, so reopening
+the data directory keeps the policy but starts the current window from
+zero. Tenant, framing, signature and conditional-header validation runs
+first — a request failing any of those keeps its original error and is
+not counted. A request that passes validation is admitted atomically
+(under the store lock, so concurrent requests can never exceed a limit)
+before any state changes or any response is sent; a rejected request
+raises `ObjectStoreError("rate limit exceeded")` (HTTP
+`429 {"error":"rate limit exceeded"}` with a `Retry-After` header holding
+the seconds left in the window, always at least 1) and changes neither
+storage nor counters. Only `/healthz` and the rate-limit management
+endpoints are never counted. The policy is persisted in the index, an
+I/O failure while saving it raises `ObjectStoreError("rate limit io
+error")` (HTTP `500`) and keeps the previous policy, clearing a tenant
+without a policy succeeds, and reading one without a policy returns
+`None`/`null`. Tenants without a saved policy see no behaviour change in
+any API, HTTP path or CLI command.
+
+The HTTP surface grows two tenant-scoped endpoints (tenant selected
+through `X-Objstore-Tenant` as usual): `GET`/`PUT`/`DELETE /v1/rate-limit`
+reads, saves or clears the policy as `{"window_seconds":...,
+"max_requests":..., "max_bytes":...}` (unset limits read as `null`, no
+policy reads as `null`, `DELETE` returns `null`), and
+`GET /v1/rate-limit/usage` returns the four counters exactly like
+`get_rate_limit_usage` (`null` without a policy). The command line
+interface is unchanged by this feature.
+
 
 ## Tests
 
@@ -528,6 +582,10 @@ checks.
 | GET | `/v1/access-policy` | 200 `{"mode": "public"|"signed"}` for the selected tenant | 400 invalid tenant, 405 |
 | PUT | `/v1/access-policy` | 200 `{"mode": ...}`; body is a JSON object with `mode` (`public`/`signed`) and, for `signed`, a 16–256 character UTF-8 `secret` | 400 invalid access policy, 405, 411, 500 access policy io error |
 | DELETE | `/v1/access-policy` | 200 `{"mode": "public"}`; restores public reads | 400 invalid tenant, 405, 500 access policy io error |
+| GET | `/v1/rate-limit` | 200 `{"window_seconds": <int>, "max_requests": <int|null>, "max_bytes": <int|null>}` or `null` for the selected tenant | 400 invalid tenant, 405 |
+| PUT | `/v1/rate-limit` | 200 with the saved policy; body is a JSON object with required `window_seconds` (1–86400) and at least one of `max_requests`/`max_bytes` (non-negative integers), no unknown fields | 400 invalid rate limit, 405, 411, 500 rate limit io error |
+| DELETE | `/v1/rate-limit` | 200 `null`; clears the policy (idempotent) | 400 invalid tenant, 405, 500 rate limit io error |
+| GET | `/v1/rate-limit/usage` | 200 `{"window_start","reset_at","requests","bytes"}` or `null` for the selected tenant | 400 invalid tenant, 405 |
 
 Notes:
 
@@ -591,7 +649,10 @@ Upload session notes:
                         #  "quota":{"<tenant>":{"max_bytes"?,"max_objects"?}},
                         #  "lifecycle":{"<tenant>":{"prefix","max_age_seconds"}},
                         #  "access":{"<tenant>":{"mode":"signed","secret"}}
-                        #  (only tenants with a saved policy)}
+                        #  (only tenants with a saved policy),
+                        #  "rate_limit":{"<tenant>":{"window_seconds",
+                        #  "max_requests"?,"max_bytes"?}} (only tenants with
+                        #  a saved policy)}
   blobs/<sha256>        # raw object bytes, one file per distinct digest
   uploads/<session>.json  # active upload declaration plus confirmed offset, tenant
                           # (non-default only) and optional expected_sha256 publish
@@ -609,15 +670,16 @@ every tenant starts unlimited. Indexes written before lifecycle existed have
 no `lifecycle` map and their entries lack `last_modified`; those directories
 open unchanged and the timeless entries are never expired by a lifecycle
 run. Indexes written before access policies existed have no `access` map, so
-every tenant starts public.
+every tenant starts public. Indexes written before rate limiting existed
+have no `rate_limit` map, so every tenant starts unlimited.
 
 ## Limits of this seed
 
 The following long-term goals are intentionally not implemented yet:
-rate limiting, consistent hashing and rebalancing, erasure coding and
+consistent hashing and rebalancing, erasure coding and
 repair, cross-region replication and end-to-end audit logging. Resumable
 uploads are exposed through the
 Python API and the HTTP surface; the command line interface does not
 expose them yet, and likewise exposes no versioning, retention, quota,
-lifecycle or access-policy commands.
+lifecycle, access-policy or rate-limit commands.
 Authentication is out of scope: the server trusts every caller.
