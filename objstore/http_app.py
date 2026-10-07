@@ -21,7 +21,8 @@ unknown key or version still gets the plain 404.
 
 The rate-limit endpoints (``/v1/rate-limit`` and ``/v1/rate-limit/usage``)
 are tenant-scoped the same way and manage the tenant's fixed-window
-request policy; they and ``/healthz`` are the only requests never counted.
+request policy; they, the audit endpoints and ``/healthz`` are the only
+requests never counted.
 Every other request is admitted atomically against the selected tenant's
 saved policy after tenant, framing, signature and precondition validation;
 a rejected request gets ``429 {"error":"rate limit exceeded"}`` with a
@@ -29,6 +30,14 @@ a rejected request gets ``429 {"error":"rate limit exceeded"}`` with a
 changes neither storage nor counters. The blob endpoint stays global: an
 absent or invalid tenant header never fails it, the request is simply
 accounted against the default tenant.
+
+The audit endpoints (``GET /v1/audit`` and ``GET /v1/audit/verify``) are
+tenant-scoped through the same header and expose the tenant's own audit
+events and chain verification; they record no audit events themselves
+and are never rate limited. A malformed ``after``/``limit`` query
+parameter is ``400 {"error":"invalid audit query"}``, a broken log
+``500 {"error":"audit corrupted"}`` and a log I/O failure
+``500 {"error":"audit io error"}``.
 """
 
 from __future__ import annotations
@@ -66,6 +75,8 @@ _LIFECYCLE_RUN_PATH = "/v1/lifecycle/run"
 _ACCESS_POLICY_PATH = "/v1/access-policy"
 _RATE_LIMIT_PATH = "/v1/rate-limit"
 _RATE_LIMIT_USAGE_PATH = "/v1/rate-limit/usage"
+_AUDIT_PATH = "/v1/audit"
+_AUDIT_VERIFY_PATH = "/v1/audit/verify"
 _TENANT_HEADER = "X-Objstore-Tenant"
 _DEFAULT_CONTENT_TYPE = "application/octet-stream"
 _DECIMAL_RE = re.compile(r"\A[0-9]+\Z")
@@ -75,12 +86,14 @@ _BAD_REQUEST_PREFIXES = (
     "invalid precondition", "invalid tenant", "invalid version",
     "invalid retention", "invalid dry_run", "invalid quota",
     "invalid lifecycle", "invalid access policy", "invalid rate limit",
+    "invalid audit query",
     "versioning disabled",
     "payload", "content_type",
 )
 _INTERNAL_ERRORS = ("corrupted blob", "blob io error", "upload io error",
                     "version io error", "quota io error", "lifecycle io error",
-                    "access policy io error", "rate limit io error")
+                    "access policy io error", "rate limit io error",
+                    "audit corrupted", "audit io error")
 
 
 def _json_bytes(payload):
@@ -255,6 +268,17 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
                     return self._error(405, "method not allowed")
                 return self._send(200, _json_bytes(
                     self.server.store.get_rate_limit_usage(tenant=tenant)))
+            if path == _AUDIT_PATH:
+                tenant = self._tenant()
+                if method != "GET":
+                    return self._error(405, "method not allowed")
+                return self._audit(parsed.query, tenant)
+            if path == _AUDIT_VERIFY_PATH:
+                tenant = self._tenant()
+                if method != "GET":
+                    return self._error(405, "method not allowed")
+                return self._send(200, _json_bytes(
+                    self.server.store.verify_audit_log(tenant=tenant)))
             if path.startswith(_OBJECTS_PATH + "/"):
                 return self._object(method, unquote(path[len(_OBJECTS_PATH) + 1:]),
                                     parsed.query)
@@ -763,6 +787,25 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
             "max_requests": document.get("max_requests"),
             "max_bytes": document.get("max_bytes"),
         }))
+
+    # -- audit ------------------------------------------------------------
+    def _audit(self, query, tenant):
+        """Serve ``GET /v1/audit``: one page of the tenant's audit events."""
+        params = parse_qs(query, keep_blank_values=True)
+        after = None
+        raw_after = params.get("after", [None])[0]
+        if raw_after:
+            if _DECIMAL_RE.match(raw_after) is None:
+                raise ObjectStoreError("invalid audit query")
+            after = int(raw_after)
+        limit = DEFAULT_LIMIT
+        raw_limit = params.get("limit", [None])[0]
+        if raw_limit is not None:
+            if _DECIMAL_RE.match(raw_limit) is None:
+                raise ObjectStoreError("invalid audit query")
+            limit = int(raw_limit)
+        return self._send(200, _json_bytes(self.server.store.list_audit_events(
+            after=after, limit=limit, tenant=tenant)))
 
 
 class ObjectStoreHTTPServer(ThreadingHTTPServer):

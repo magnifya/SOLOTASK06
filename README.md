@@ -17,7 +17,8 @@ control, cross-region replication and end-to-end audit. Multi-tenant namespaces,
 conditional writes, resumable uploads, object versioning with retention,
 per-tenant quotas, persistent object lifecycle policies, signed read
 access policies and per-tenant fixed-window rate limiting are already
-implemented.
+implemented. Per-tenant persistent audit logging with hash-chained
+verification is implemented as well.
 
 ## Requirements
 
@@ -487,8 +488,8 @@ before any state changes or any response is sent; a rejected request
 raises `ObjectStoreError("rate limit exceeded")` (HTTP
 `429 {"error":"rate limit exceeded"}` with a `Retry-After` header holding
 the seconds left in the window, always at least 1) and changes neither
-storage nor counters. Only `/healthz` and the rate-limit management
-endpoints are never counted. The policy is persisted in the index, an
+storage nor counters. Only `/healthz`, the rate-limit management
+endpoints and the audit endpoints are never counted. The policy is persisted in the index, an
 I/O failure while saving it raises `ObjectStoreError("rate limit io
 error")` (HTTP `500`) and keeps the previous policy, clearing a tenant
 without a policy succeeds, and reading one without a policy returns
@@ -502,6 +503,52 @@ reads, saves or clears the policy as `{"window_seconds":...,
 policy reads as `null`, `DELETE` returns `null`), and
 `GET /v1/rate-limit/usage` returns the four counters exactly like
 `get_rate_limit_usage` (`null` without a policy). The command line
+interface is unchanged by this feature.
+
+### Audit log
+
+Every object, upload-session, version and policy operation — through the
+Python API or HTTP — appends one event to `<data-dir>/audit.log` before
+returning; `blob` reads and garbage collection are recorded under the
+`global` tenant. An event is one JSON line holding a per-tenant ascending
+`seq`, a UTC `timestamp`, the `tenant`, the `operation`, the target
+`key`/`session`/`version` when applicable and the `result` (`"ok"` or
+`"error"`); successful object events also carry `sha256` and `size`, and
+failures a stable `error` message. Content, request bodies and secrets
+are never recorded. Each tenant's events form a hash chain: every event
+records the previous event's hash in `prev_hash` and its own `hash`, so
+tampering is detectable per tenant.
+
+```python
+store.list_audit_events(after=None, limit=100, tenant="acme")
+# -> {"items": [{"seq","timestamp","tenant","operation","result",...,
+#                "prev_hash","hash"}, ...],
+#     "next_after": <seq or null>}   — ascending seq, paginate with after/limit
+store.verify_audit_log(tenant="acme")
+# -> {"ok": True, "events": <int>, "last_seq": <int or null>,
+#     "head": <hash or null>}
+```
+
+`after` is an exclusive non-negative integer sequence cursor and `limit`
+bounds the page at 1–1000; tenants only ever see their own events and an
+unknown tenant reads as an empty page. Querying and verifying record no
+audit events themselves, and any parameter problem raises
+`ObjectStoreError("invalid audit query")` (HTTP
+`400 {"error":"invalid audit query"}`). Reopening the data directory
+continues every sequence, silently dropping a trailing incomplete record
+left by a crash; a format error, a sequence gap or a chain mismatch
+anywhere else raises `ObjectStoreError("audit corrupted")` (HTTP `500`),
+and a directory without a log opens as an empty one. A failed audit
+append raises `ObjectStoreError("audit io error")` (HTTP `500`): write
+operations roll their object, version, session and policy changes back
+and read operations return no data.
+
+The HTTP surface grows two tenant-scoped endpoints (tenant selected
+through `X-Objstore-Tenant` as usual): `GET /v1/audit?after=&limit=`
+returns one page of the tenant's events exactly like
+`list_audit_events`, and `GET /v1/audit/verify` returns the verification
+summary exactly like `verify_audit_log`. Neither endpoint records an
+audit event or consumes rate-limit budget, and the command line
 interface is unchanged by this feature.
 
 
@@ -586,6 +633,8 @@ checks.
 | PUT | `/v1/rate-limit` | 200 with the saved policy; body is a JSON object with required `window_seconds` (1–86400) and at least one of `max_requests`/`max_bytes` (non-negative integers), no unknown fields | 400 invalid rate limit, 405, 411, 500 rate limit io error |
 | DELETE | `/v1/rate-limit` | 200 `null`; clears the policy (idempotent) | 400 invalid tenant, 405, 500 rate limit io error |
 | GET | `/v1/rate-limit/usage` | 200 `{"window_start","reset_at","requests","bytes"}` or `null` for the selected tenant | 400 invalid tenant, 405 |
+| GET | `/v1/audit?after=&limit=` | 200 `{"items":[{...event...}],"next_after":<int or null>}` for the selected tenant | 400 invalid audit query / invalid tenant, 405, 500 audit corrupted / audit io error |
+| GET | `/v1/audit/verify` | 200 `{"ok":true,"events":<int>,"last_seq":<int or null>,"head":<str or null>}` for the selected tenant | 400 invalid audit query / invalid tenant, 405, 500 audit corrupted / audit io error |
 
 Notes:
 
@@ -654,6 +703,10 @@ Upload session notes:
                         #  "max_requests"?,"max_bytes"?}} (only tenants with
                         #  a saved policy)}
   blobs/<sha256>        # raw object bytes, one file per distinct digest
+  audit.log             # one JSON event per line: {"seq","timestamp","tenant",
+                        # "operation","result","key"?,"session"?,"version"?,
+                        # "sha256"?,"size"?,"error"?,"prev_hash","hash"}
+                        # (created on the first audited operation)
   uploads/<session>.json  # active upload declaration plus confirmed offset, tenant
                           # (non-default only) and optional expected_sha256 publish
                           # condition (lazy directory)
@@ -671,7 +724,9 @@ no `lifecycle` map and their entries lack `last_modified`; those directories
 open unchanged and the timeless entries are never expired by a lifecycle
 run. Indexes written before access policies existed have no `access` map, so
 every tenant starts public. Indexes written before rate limiting existed
-have no `rate_limit` map, so every tenant starts unlimited.
+have no `rate_limit` map, so every tenant starts unlimited. Directories
+written before auditing existed have no `audit.log`; they open as an
+empty log and the file appears with the first audited operation.
 
 ## Limits of this seed
 

@@ -83,6 +83,26 @@ limit exceeded") before any state changes and is not itself counted;
 counters live in memory only, so reopening the data directory keeps the
 policy but starts the current window from zero. Tenants without a saved
 policy are unlimited and see no behaviour change.
+
+Every object, upload-session, version and policy operation appends one
+event to the persistent audit log ``<root>/audit.log`` before returning
+(:meth:`blob` and :meth:`collect_garbage` are recorded under the
+``global`` tenant). An event holds a per-tenant ascending ``seq``, a UTC
+``timestamp``, the ``tenant``, the ``operation``, the target
+``key``/``session``/``version`` when applicable and the ``result``
+(``"ok"`` or ``"error"``); successful object events also carry ``sha256``
+and ``size`` and failures a stable ``error`` message. Content, request
+bodies and secrets are never recorded. Events of one tenant are chained:
+each records the previous event's hash in ``prev_hash`` and its own
+``hash``. Reopening the data directory continues the sequences, dropping
+a trailing incomplete record left by a crash; a format error, a sequence
+gap or a chain mismatch anywhere else raises
+``ObjectStoreError("audit corrupted")`` and a directory without a log
+opens as an empty one. A failed audit append raises
+``ObjectStoreError("audit io error")``: writes roll their object,
+version, session and policy changes back and reads return no data.
+:meth:`list_audit_events` and :meth:`verify_audit_log` read the log
+per tenant and record no events themselves.
 """
 
 from __future__ import annotations
@@ -104,6 +124,8 @@ __all__ = ["ContentAddressedStore", "ObjectStoreError", "RateLimitExceeded",
 INDEX_NAME = "index.json"
 BLOBS_DIRNAME = "blobs"
 UPLOADS_DIRNAME = "uploads"
+AUDIT_NAME = "audit.log"
+AUDIT_GLOBAL_TENANT = "global"
 INDEX_VERSION = 1
 DEFAULT_LIMIT = 100
 MAX_LIMIT = 1000
@@ -175,6 +197,7 @@ class ContentAddressedStore:
         self.blobs_dir = os.path.join(self.root, BLOBS_DIRNAME)
         self.uploads_dir = os.path.join(self.root, UPLOADS_DIRNAME)
         self.index_path = os.path.join(self.root, INDEX_NAME)
+        self.audit_path = os.path.join(self.root, AUDIT_NAME)
         self._lock = threading.RLock()
         os.makedirs(self.blobs_dir, exist_ok=True)
         (self._objects, self._timestamps, self._upload_records,
@@ -183,6 +206,8 @@ class ContentAddressedStore:
         self._uploads = self._load_uploads()
         # In-memory fixed-window counters per tenant; never persisted.
         self._rate_windows = {}
+        (self._audit_seqs, self._audit_heads,
+         self._audit_events) = self._load_audit()
 
     # -- index ---------------------------------------------------------
     def _load_index(self):
@@ -549,6 +574,281 @@ class ContentAddressedStore:
             return entry is None
         return entry is not None and entry["sha256"] == expected
 
+    # -- audit -------------------------------------------------------------
+    @staticmethod
+    def _audit_canonical(event):
+        """Serialize *event* deterministically for hashing and storage."""
+        return json.dumps(event, sort_keys=True,
+                          separators=(",", ":")).encode("utf-8")
+
+    @classmethod
+    def _audit_hash(cls, event):
+        """Return the chain hash of *event* (every field except ``hash``)."""
+        payload = {name: value for name, value in event.items()
+                   if name != "hash"}
+        return hashlib.sha256(cls._audit_canonical(payload)).hexdigest()
+
+    @staticmethod
+    def _parse_audit_line(line):
+        """Parse and validate one audit log line or raise ``audit corrupted``."""
+        try:
+            event = json.loads(line.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            raise ObjectStoreError("audit corrupted")
+        if not isinstance(event, dict):
+            raise ObjectStoreError("audit corrupted")
+        seq = event.get("seq")
+        if isinstance(seq, bool) or not isinstance(seq, int) or seq < 1:
+            raise ObjectStoreError("audit corrupted")
+        tenant = event.get("tenant")
+        if not isinstance(tenant, str) or _TENANT_RE.match(tenant) is None:
+            raise ObjectStoreError("audit corrupted")
+        if not isinstance(event.get("timestamp"), str):
+            raise ObjectStoreError("audit corrupted")
+        if not isinstance(event.get("operation"), str):
+            raise ObjectStoreError("audit corrupted")
+        if event.get("result") not in ("ok", "error"):
+            raise ObjectStoreError("audit corrupted")
+        if "prev_hash" not in event:
+            raise ObjectStoreError("audit corrupted")
+        prev_hash = event["prev_hash"]
+        if prev_hash is not None and not _is_sha256(prev_hash):
+            raise ObjectStoreError("audit corrupted")
+        if not _is_sha256(event.get("hash")):
+            raise ObjectStoreError("audit corrupted")
+        for name in ("key", "session", "version", "error"):
+            value = event.get(name)
+            if value is not None and not isinstance(value, str):
+                raise ObjectStoreError("audit corrupted")
+        sha256 = event.get("sha256")
+        if sha256 is not None and not _is_sha256(sha256):
+            raise ObjectStoreError("audit corrupted")
+        size = event.get("size")
+        if size is not None and (isinstance(size, bool)
+                                 or not isinstance(size, int) or size < 0):
+            raise ObjectStoreError("audit corrupted")
+        return event
+
+    def _load_audit(self):
+        """Load the audit log as (per-tenant seqs, heads, events).
+
+        A missing log opens as empty. A trailing incomplete record (a crash
+        mid-append) is discarded and truncated away; any other format error,
+        a sequence gap or a hash-chain mismatch raises
+        ``ObjectStoreError("audit corrupted")``.
+        """
+        seqs, heads, events = {}, {}, {}
+        try:
+            with open(self.audit_path, "rb") as handle:
+                raw = handle.read()
+        except FileNotFoundError:
+            return seqs, heads, events
+        except OSError:
+            raise ObjectStoreError("audit io error")
+        lines = raw.split(b"\n")
+        trailing = lines.pop()
+        for line in lines:
+            event = self._parse_audit_line(line)
+            tenant = event["tenant"]
+            if event["seq"] != seqs.get(tenant, 0) + 1 \
+                    or event["prev_hash"] != heads.get(tenant) \
+                    or event["hash"] != self._audit_hash(event):
+                raise ObjectStoreError("audit corrupted")
+            seqs[tenant] = event["seq"]
+            heads[tenant] = event["hash"]
+            events.setdefault(tenant, []).append(event)
+        if trailing:
+            offset = sum(len(line) + 1 for line in lines)
+            try:
+                with open(self.audit_path, "r+b") as handle:
+                    handle.truncate(offset)
+            except OSError:
+                raise ObjectStoreError("audit io error")
+        return seqs, heads, events
+
+    def _audit_event(self, tenant, operation, key=None, session=None,
+                     version=None, result="ok", sha256=None, size=None,
+                     error=None):
+        """Append one event to *tenant*'s audit chain; caller holds the lock.
+
+        Content, request bodies and secrets are never recorded. A failed
+        write or flush is ``ObjectStoreError("audit io error")`` and leaves
+        the chain untouched.
+        """
+        event = {"seq": self._audit_seqs.get(tenant, 0) + 1,
+                 "timestamp": datetime.now(timezone.utc).isoformat(),
+                 "tenant": tenant, "operation": operation, "result": result}
+        if key is not None:
+            event["key"] = key
+        if session is not None:
+            event["session"] = session
+        if version is not None:
+            event["version"] = version
+        if sha256 is not None:
+            event["sha256"] = sha256
+        if size is not None:
+            event["size"] = size
+        if error is not None:
+            event["error"] = error
+        event["prev_hash"] = self._audit_heads.get(tenant)
+        event["hash"] = self._audit_hash(event)
+        line = self._audit_canonical(event) + b"\n"
+        try:
+            with open(self.audit_path, "ab") as handle:
+                handle.write(line)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError:
+            raise ObjectStoreError("audit io error")
+        self._audit_seqs[tenant] = event["seq"]
+        self._audit_heads[tenant] = event["hash"]
+        self._audit_events.setdefault(tenant, []).append(event)
+
+    def _audit_ok(self, tenant, operation, **fields):
+        """Record a successful *operation* for *tenant*."""
+        with self._lock:
+            self._audit_event(tenant, operation, result="ok", **fields)
+
+    def _audit_error(self, tenant, operation, exc, **target):
+        """Record a failed *operation*; an audit I/O failure wins over *exc*."""
+        fields = {name: value for name, value in target.items()
+                  if isinstance(value, str)}
+        with self._lock:
+            self._audit_event(tenant, operation, result="error",
+                              error=str(exc), **fields)
+
+    def _audit_snapshot(self, tenant):
+        """Capture *tenant*'s mutable state for an audit-failure rollback."""
+        snapshot = {}
+        for name in ("_objects", "_timestamps", "_versions", "_versioning",
+                     "_retention", "_quota", "_lifecycle", "_access",
+                     "_rate_limit"):
+            value = getattr(self, name).get(tenant, _MISSING)
+            if value is _MISSING:
+                continue
+            if isinstance(value, dict):
+                value = {key: (list(item) if isinstance(item, list)
+                               else dict(item) if isinstance(item, dict)
+                               else item)
+                         for key, item in value.items()}
+            snapshot[name] = value
+        snapshot["_upload_records"] = {
+            session_id: dict(record)
+            for session_id, record in self._upload_records.items()
+            if record["tenant"] == tenant}
+        snapshot["_uploads"] = {
+            session_id: dict(session)
+            for session_id, session in self._uploads.items()
+            if session["tenant"] == tenant}
+        return snapshot
+
+    def _audit_restore(self, tenant, snapshot):
+        """Undo a write with *snapshot* after its audit append failed."""
+        for name in ("_objects", "_timestamps", "_versions", "_versioning",
+                     "_retention", "_quota", "_lifecycle", "_access",
+                     "_rate_limit"):
+            mapping = getattr(self, name)
+            if name in snapshot:
+                mapping[tenant] = snapshot[name]
+            else:
+                mapping.pop(tenant, None)
+        for session_id in [session_id for session_id, record
+                           in self._upload_records.items()
+                           if record["tenant"] == tenant]:
+            del self._upload_records[session_id]
+        self._upload_records.update(snapshot["_upload_records"])
+        for session_id in [session_id for session_id, session
+                           in self._uploads.items()
+                           if session["tenant"] == tenant]:
+            del self._uploads[session_id]
+        self._uploads.update(snapshot["_uploads"])
+        self._save_index()
+
+    def _audit_commit(self, tenant, snapshot, operation, **fields):
+        """Record a successful write, rolling *snapshot* back on audit failure."""
+        try:
+            self._audit_ok(tenant, operation, **fields)
+        except ObjectStoreError:
+            with self._lock:
+                try:
+                    self._audit_restore(tenant, snapshot)
+                except OSError:
+                    pass
+            raise
+
+    @staticmethod
+    def _check_audit_query(after, limit):
+        """Validate the shared audit query parameters."""
+        if after is not None and (isinstance(after, bool)
+                                  or not isinstance(after, int) or after < 0):
+            raise ObjectStoreError("invalid audit query")
+        if isinstance(limit, bool) or not isinstance(limit, int) \
+                or not 1 <= limit <= MAX_LIMIT:
+            raise ObjectStoreError("invalid audit query")
+
+    def list_audit_events(self, after=None, limit=DEFAULT_LIMIT,
+                          tenant=DEFAULT_TENANT):
+        """Return ``{"items": [...], "next_after": <int|null>}`` for one page.
+
+        Only *tenant*'s own events are listed, in ascending ``seq`` order;
+        *after* is an exclusive non-negative integer sequence cursor and
+        *limit* bounds the page at 1 to 1000 events. A tenant without
+        events yields an empty page. Querying records no audit event
+        itself, and any parameter problem is
+        ``ObjectStoreError("invalid audit query")``.
+        """
+        try:
+            self._check_tenant(tenant)
+        except ObjectStoreError:
+            raise ObjectStoreError("invalid audit query")
+        self._check_audit_query(after, limit)
+        with self._lock:
+            events = self._audit_events.get(tenant, [])
+            cursor = after or 0
+            remaining = [event for event in events if event["seq"] > cursor]
+            page = remaining[:limit]
+            return {"items": [dict(event) for event in page],
+                    "next_after": page[-1]["seq"]
+                    if len(remaining) > len(page) else None}
+
+    def verify_audit_log(self, tenant=DEFAULT_TENANT):
+        """Verify *tenant*'s on-disk audit chain and return a summary.
+
+        The result is ``{"ok": True, "events": <int>, "last_seq":
+        <int|null>, "head": <str|null>}``; a tenant without events
+        verifies with zero events and null cursor fields. A format error,
+        a sequence gap or a hash-chain mismatch raises
+        ``ObjectStoreError("audit corrupted")``. Verifying records no
+        audit event itself.
+        """
+        try:
+            self._check_tenant(tenant)
+        except ObjectStoreError:
+            raise ObjectStoreError("invalid audit query")
+        with self._lock:
+            try:
+                with open(self.audit_path, "rb") as handle:
+                    raw = handle.read()
+            except FileNotFoundError:
+                raw = b""
+            except OSError:
+                raise ObjectStoreError("audit io error")
+            lines = raw.split(b"\n")
+            lines.pop()  # a trailing incomplete record is ignored
+            count, last_seq, head = 0, None, None
+            for line in lines:
+                event = self._parse_audit_line(line)
+                if event["tenant"] != tenant:
+                    continue
+                if event["seq"] != (last_seq or 0) + 1 \
+                        or event["prev_hash"] != head \
+                        or event["hash"] != self._audit_hash(event):
+                    raise ObjectStoreError("audit corrupted")
+                last_seq, head = event["seq"], event["hash"]
+                count += 1
+            return {"ok": True, "events": count, "last_seq": last_seq,
+                    "head": head}
+
     # -- object API ----------------------------------------------------
     def put(self, key, payload, content_type=None, expected_sha256=_MISSING,
             tenant=DEFAULT_TENANT):
@@ -570,36 +870,44 @@ class ContentAddressedStore:
         the resulting usage would exceed a saved limit.
         """
         self._check_tenant(tenant)
-        self._check_key(key)
-        if not isinstance(payload, (bytes, bytearray, memoryview)):
-            raise ObjectStoreError("payload must be bytes")
-        if content_type is not None and not isinstance(content_type, str):
-            raise ObjectStoreError("content_type must be a string or None")
-        expected = self._check_precondition(expected_sha256)
-        data = bytes(payload)
-        sha = hashlib.sha256(data).hexdigest()
-        entry = {"sha256": sha, "size": len(data), "content_type": content_type}
-        with self._lock:
-            if expected is not _MISSING and not self._precondition_met(
-                    tenant, key, expected):
-                raise ObjectStoreError("precondition failed")
-            self._rate_limit_check(tenant, len(data))
-            versioning_on = self._versioning.get(tenant, False)
-            delta_bytes, delta_objects = self._publish_delta(
-                tenant, key, entry, versioning_on)
-            self._enforce_quota(tenant, delta_bytes, delta_objects)
-            self._store_blob(sha, data)
-            self._objects.setdefault(tenant, {})[key] = entry
-            self._timestamps.setdefault(tenant, {})[key] = \
-                datetime.now(timezone.utc).isoformat()
-            version_id = None
-            if versioning_on:
-                version_id = self._append_version(tenant, key, entry)
-            self._save_index()
-            result = dict(entry)
-            if version_id is not None:
-                result["version_id"] = version_id
-            return result
+        try:
+            self._check_key(key)
+            if not isinstance(payload, (bytes, bytearray, memoryview)):
+                raise ObjectStoreError("payload must be bytes")
+            if content_type is not None and not isinstance(content_type, str):
+                raise ObjectStoreError("content_type must be a string or None")
+            expected = self._check_precondition(expected_sha256)
+            data = bytes(payload)
+            sha = hashlib.sha256(data).hexdigest()
+            entry = {"sha256": sha, "size": len(data),
+                     "content_type": content_type}
+            with self._lock:
+                if expected is not _MISSING and not self._precondition_met(
+                        tenant, key, expected):
+                    raise ObjectStoreError("precondition failed")
+                self._rate_limit_check(tenant, len(data))
+                versioning_on = self._versioning.get(tenant, False)
+                delta_bytes, delta_objects = self._publish_delta(
+                    tenant, key, entry, versioning_on)
+                self._enforce_quota(tenant, delta_bytes, delta_objects)
+                snapshot = self._audit_snapshot(tenant)
+                self._store_blob(sha, data)
+                self._objects.setdefault(tenant, {})[key] = entry
+                self._timestamps.setdefault(tenant, {})[key] = \
+                    datetime.now(timezone.utc).isoformat()
+                version_id = None
+                if versioning_on:
+                    version_id = self._append_version(tenant, key, entry)
+                self._save_index()
+                result = dict(entry)
+                if version_id is not None:
+                    result["version_id"] = version_id
+        except ObjectStoreError as exc:
+            self._audit_error(tenant, "put", exc, key=key)
+            raise
+        self._audit_commit(tenant, snapshot, "put", key=key,
+                           sha256=sha, size=len(data))
+        return result
 
     def _append_version(self, tenant, key, entry):
         """Append a new immutable version for *key* and return its id.
@@ -661,16 +969,22 @@ class ContentAddressedStore:
         ``ObjectStoreError("access denied")`` before the key is looked up.
         """
         self._check_tenant(tenant)
-        self._check_key(key)
-        with self._lock:
-            self._check_read_access(tenant, key, None, expires, signature,
-                                    "GET")
-            self._rate_limit_check(tenant)
-            entry = self._head_unlocked(tenant, key)
-            data = self._blob_unlocked(entry["sha256"])
-            if len(data) != entry["size"]:
-                raise ObjectStoreError("corrupted blob")
-            return data, entry
+        try:
+            self._check_key(key)
+            with self._lock:
+                self._check_read_access(tenant, key, None, expires, signature,
+                                        "GET")
+                self._rate_limit_check(tenant)
+                entry = self._head_unlocked(tenant, key)
+                data = self._blob_unlocked(entry["sha256"])
+                if len(data) != entry["size"]:
+                    raise ObjectStoreError("corrupted blob")
+        except ObjectStoreError as exc:
+            self._audit_error(tenant, "get", exc, key=key)
+            raise
+        self._audit_ok(tenant, "get", key=key, sha256=entry["sha256"],
+                       size=entry["size"])
+        return data, entry
 
     def head(self, key, tenant=DEFAULT_TENANT, expires=None, signature=None):
         """Return a copy of the metadata entry for *key* in *tenant*.
@@ -679,12 +993,19 @@ class ContentAddressedStore:
         :meth:`get`, but computed for the ``HEAD`` method.
         """
         self._check_tenant(tenant)
-        self._check_key(key)
-        with self._lock:
-            self._check_read_access(tenant, key, None, expires, signature,
-                                    "HEAD")
-            self._rate_limit_check(tenant)
-            return self._head_unlocked(tenant, key)
+        try:
+            self._check_key(key)
+            with self._lock:
+                self._check_read_access(tenant, key, None, expires, signature,
+                                        "HEAD")
+                self._rate_limit_check(tenant)
+                entry = self._head_unlocked(tenant, key)
+        except ObjectStoreError as exc:
+            self._audit_error(tenant, "head", exc, key=key)
+            raise
+        self._audit_ok(tenant, "head", key=key, sha256=entry["sha256"],
+                       size=entry["size"])
+        return entry
 
     def _peek_head(self, tenant, key):
         """Return *key*'s entry the way :meth:`head` does, uncounted.
@@ -719,18 +1040,25 @@ class ContentAddressedStore:
         current, and the key disappears entirely once no version remains.
         """
         self._check_tenant(tenant)
-        self._check_key(key)
-        expected = self._check_precondition(expected_sha256)
-        with self._lock:
-            objects = self._objects.get(tenant, {})
-            if key not in objects:
-                raise ObjectStoreError("not found: %s" % (key,))
-            if expected is not _MISSING and not self._precondition_met(
-                    tenant, key, expected):
-                raise ObjectStoreError("precondition failed")
-            self._rate_limit_check(tenant)
-            self._remove_current_unlocked(tenant, key)
-            self._save_index()
+        try:
+            self._check_key(key)
+            expected = self._check_precondition(expected_sha256)
+            with self._lock:
+                objects = self._objects.get(tenant, {})
+                if key not in objects:
+                    raise ObjectStoreError("not found: %s" % (key,))
+                if expected is not _MISSING and not self._precondition_met(
+                        tenant, key, expected):
+                    raise ObjectStoreError("precondition failed")
+                self._rate_limit_check(tenant)
+                snapshot = self._audit_snapshot(tenant)
+                removed = self._remove_current_unlocked(tenant, key)
+                self._save_index()
+        except ObjectStoreError as exc:
+            self._audit_error(tenant, "delete", exc, key=key)
+            raise
+        self._audit_commit(tenant, snapshot, "delete", key=key,
+                           sha256=removed["sha256"], size=removed["size"])
 
     def _remove_current_unlocked(self, tenant, key):
         """Remove *key*'s current object the way :meth:`delete` does.
@@ -780,13 +1108,21 @@ class ContentAddressedStore:
         rejected instead of being handed back to the caller.
 
         Blobs stay global; *tenant* only selects the rate limit policy the
-        read is accounted against (the default tenant when omitted).
+        read is accounted against (the default tenant when omitted). The
+        read is audited under the ``global`` tenant.
         """
-        self._require_sha(sha256)
-        self._check_tenant(tenant)
-        with self._lock:
-            self._rate_limit_check(tenant)
-            return self._blob_unlocked(sha256)
+        try:
+            self._require_sha(sha256)
+            self._check_tenant(tenant)
+            with self._lock:
+                self._rate_limit_check(tenant)
+                data = self._blob_unlocked(sha256)
+        except ObjectStoreError as exc:
+            self._audit_error(AUDIT_GLOBAL_TENANT, "blob", exc)
+            raise
+        self._audit_ok(AUDIT_GLOBAL_TENANT, "blob", sha256=sha256,
+                       size=len(data))
+        return data
 
     def _blob_unlocked(self, sha256):
         """Return the verified bytes of *sha256*; must be called under the lock."""
@@ -1011,33 +1347,45 @@ class ContentAddressedStore:
         ``ObjectStoreError("quota exceeded")`` is raised.
         """
         self._check_tenant(tenant)
-        self._check_key(key)
-        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
-            raise ObjectStoreError("invalid size: %r" % (size,))
-        self._require_sha(sha256)
-        if content_type is not None and not isinstance(content_type, str):
-            raise ObjectStoreError("content_type must be a string or None")
-        expected = self._check_precondition(expected_sha256)
-        session = {"key": key, "size": size, "sha256": sha256,
-                   "content_type": content_type, "offset": 0,
-                   "expected_sha256": expected, "tenant": tenant}
-        with self._lock:
-            self._rate_limit_check(tenant)
-            self._enforce_reservation(tenant, size)
-            session_id = self._new_session_id()
-            try:
-                os.makedirs(self.uploads_dir, exist_ok=True)
-                with open(self._session_part_path(session_id), "wb"):
-                    pass
-            except OSError:
-                raise ObjectStoreError("upload io error")
-            try:
-                self._save_session(session_id, session)
-            except ObjectStoreError:
+        try:
+            self._check_key(key)
+            if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+                raise ObjectStoreError("invalid size: %r" % (size,))
+            self._require_sha(sha256)
+            if content_type is not None and not isinstance(content_type, str):
+                raise ObjectStoreError("content_type must be a string or None")
+            expected = self._check_precondition(expected_sha256)
+            session = {"key": key, "size": size, "sha256": sha256,
+                       "content_type": content_type, "offset": 0,
+                       "expected_sha256": expected, "tenant": tenant}
+            with self._lock:
+                self._rate_limit_check(tenant)
+                self._enforce_reservation(tenant, size)
+                session_id = self._new_session_id()
+                try:
+                    os.makedirs(self.uploads_dir, exist_ok=True)
+                    with open(self._session_part_path(session_id), "wb"):
+                        pass
+                except OSError:
+                    raise ObjectStoreError("upload io error")
+                try:
+                    self._save_session(session_id, session)
+                except ObjectStoreError:
+                    self._discard_session_files(session_id)
+                    raise
+                self._uploads[session_id] = session
+        except ObjectStoreError as exc:
+            self._audit_error(tenant, "begin_upload", exc, key=key)
+            raise
+        try:
+            self._audit_ok(tenant, "begin_upload", key=key,
+                           session=session_id)
+        except ObjectStoreError:
+            with self._lock:
+                self._uploads.pop(session_id, None)
                 self._discard_session_files(session_id)
-                raise
-            self._uploads[session_id] = session
-            return session_id
+            raise
+        return session_id
 
     def upload_status(self, session_id, tenant=DEFAULT_TENANT):
         """Return the declaration, received ``offset`` and ``completed`` flag.
@@ -1047,26 +1395,35 @@ class ContentAddressedStore:
         never existed.
         """
         self._check_tenant(tenant)
-        self._check_session_id(session_id)
-        with self._lock:
-            self._rate_limit_check(tenant)
-            record = self._upload_records.get(session_id)
-            if record is not None:
-                if record["tenant"] != tenant:
-                    raise ObjectStoreError(
-                        "unknown upload session: %r" % (session_id,))
-                entry = record["entry"]
-                return {"key": record["key"], "size": entry["size"],
-                        "sha256": entry["sha256"],
-                        "content_type": entry["content_type"],
-                        "offset": entry["size"], "completed": True}
-            session = self._uploads.get(session_id)
-            if session is None or session["tenant"] != tenant:
-                raise ObjectStoreError("unknown upload session: %r" % (session_id,))
-            return {"key": session["key"], "size": session["size"],
-                    "sha256": session["sha256"],
-                    "content_type": session["content_type"],
-                    "offset": session["offset"], "completed": False}
+        try:
+            self._check_session_id(session_id)
+            with self._lock:
+                self._rate_limit_check(tenant)
+                record = self._upload_records.get(session_id)
+                if record is not None:
+                    if record["tenant"] != tenant:
+                        raise ObjectStoreError(
+                            "unknown upload session: %r" % (session_id,))
+                    entry = record["entry"]
+                    result = {"key": record["key"], "size": entry["size"],
+                              "sha256": entry["sha256"],
+                              "content_type": entry["content_type"],
+                              "offset": entry["size"], "completed": True}
+                else:
+                    session = self._uploads.get(session_id)
+                    if session is None or session["tenant"] != tenant:
+                        raise ObjectStoreError(
+                            "unknown upload session: %r" % (session_id,))
+                    result = {"key": session["key"], "size": session["size"],
+                              "sha256": session["sha256"],
+                              "content_type": session["content_type"],
+                              "offset": session["offset"], "completed": False}
+        except ObjectStoreError as exc:
+            self._audit_error(tenant, "upload_status", exc,
+                              session=session_id)
+            raise
+        self._audit_ok(tenant, "upload_status", session=session_id)
+        return result
 
     def append_upload(self, session_id, offset, payload, tenant=DEFAULT_TENANT):
         """Append one chunk to *session_id* and return the received length.
@@ -1078,36 +1435,63 @@ class ContentAddressedStore:
         past the end and empty chunks anywhere but at the end all fail.
         """
         self._check_tenant(tenant)
-        self._check_session_id(session_id)
-        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
-            raise ObjectStoreError("invalid offset: %r" % (offset,))
-        if not isinstance(payload, (bytes, bytearray, memoryview)):
-            raise ObjectStoreError("payload must be bytes")
-        data = bytes(payload)
-        with self._lock:
-            session = self._require_active_session(session_id, tenant)
-            self._rate_limit_check(tenant, len(data))
-            current = session["offset"]
-            if offset > current:
-                raise SessionConflict(
-                    "append gap: offset %d beyond received %d" % (offset, current))
-            if not data:
-                if offset != current:
-                    raise SessionConflict("empty chunk only at received end")
-                return current
-            end = offset + len(data)
-            if offset < current:
-                if end > current:
-                    raise SessionConflict("append overlaps received end")
-                if self._read_part(session_id, offset, len(data)) != data:
-                    raise SessionConflict("append conflicts with received bytes")
-                return current
-            if end > session["size"]:
-                raise SessionConflict("append exceeds declared size")
-            self._write_part(session_id, offset, data)
-            self._save_session(session_id, dict(session, offset=end))
-            session["offset"] = end
-            return end
+        try:
+            self._check_session_id(session_id)
+            if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+                raise ObjectStoreError("invalid offset: %r" % (offset,))
+            if not isinstance(payload, (bytes, bytearray, memoryview)):
+                raise ObjectStoreError("payload must be bytes")
+            data = bytes(payload)
+            with self._lock:
+                session = self._require_active_session(session_id, tenant)
+                self._rate_limit_check(tenant, len(data))
+                current = session["offset"]
+                if offset > current:
+                    raise SessionConflict(
+                        "append gap: offset %d beyond received %d" % (offset, current))
+                mutated = False
+                if not data:
+                    if offset != current:
+                        raise SessionConflict("empty chunk only at received end")
+                    result = current
+                else:
+                    end = offset + len(data)
+                    if offset < current:
+                        if end > current:
+                            raise SessionConflict("append overlaps received end")
+                        if self._read_part(session_id, offset, len(data)) != data:
+                            raise SessionConflict(
+                                "append conflicts with received bytes")
+                        result = current
+                    else:
+                        if end > session["size"]:
+                            raise SessionConflict("append exceeds declared size")
+                        self._write_part(session_id, offset, data)
+                        self._save_session(session_id, dict(session, offset=end))
+                        session["offset"] = end
+                        mutated = True
+                        result = end
+        except ObjectStoreError as exc:
+            self._audit_error(tenant, "append_upload", exc,
+                              session=session_id)
+            raise
+        try:
+            self._audit_ok(tenant, "append_upload", session=session_id)
+        except ObjectStoreError:
+            if mutated:
+                with self._lock:
+                    session["offset"] = current
+                    try:
+                        self._save_session(session_id, session)
+                        with open(self._session_part_path(session_id),
+                                  "r+b") as handle:
+                            handle.truncate(current)
+                            handle.flush()
+                            os.fsync(handle.fileno())
+                    except OSError:
+                        pass
+            raise
+        return result
 
     def complete_upload(self, session_id, tenant=DEFAULT_TENANT):
         """Publish the object once the received content matches the declaration.
@@ -1127,107 +1511,161 @@ class ContentAddressedStore:
         deletes of the key are never overwritten.
         """
         self._check_tenant(tenant)
-        self._check_session_id(session_id)
-        with self._lock:
-            record = self._upload_records.get(session_id)
-            if record is not None:
-                if record["tenant"] != tenant:
-                    raise ObjectStoreError(
-                        "unknown upload session: %r" % (session_id,))
-                entry = dict(record["entry"])
-                if record.get("version_id") is not None:
-                    entry["version_id"] = record["version_id"]
-                return entry
-            session = self._uploads.get(session_id)
-            if session is None or session["tenant"] != tenant:
-                raise ObjectStoreError("unknown upload session: %r" % (session_id,))
-            if session["offset"] != session["size"]:
-                raise SessionConflict(
-                    "upload incomplete: %d of %d bytes received"
-                    % (session["offset"], session["size"]))
-            data = self._read_part(session_id, 0, session["size"])
-            if len(data) != session["size"]:
-                raise ObjectStoreError("upload io error")
-            if hashlib.sha256(data).hexdigest() != session["sha256"]:
-                raise SessionConflict("upload hash mismatch")
-            expected = session.get("expected_sha256", _MISSING)
-            if expected is not _MISSING and not self._precondition_met(
-                    tenant, session["key"], expected):
-                raise ObjectStoreError("precondition failed")
-            self._rate_limit_check(tenant)
-            entry = {"sha256": session["sha256"], "size": session["size"],
-                     "content_type": session["content_type"]}
-            # The session's own reservation is lifted before the quota check:
-            # its reserved bytes become the used bytes being published.
-            versioning_on = self._versioning.get(tenant, False)
-            delta_bytes, delta_objects = self._publish_delta(
-                tenant, session["key"], entry, versioning_on)
-            self._enforce_quota(tenant, delta_bytes, delta_objects,
-                                release_session=session)
-            self._store_blob(session["sha256"], data)
-            objects = self._objects.setdefault(tenant, {})
-            timestamps = self._timestamps.setdefault(tenant, {})
-            previous = objects.get(session["key"], _MISSING)
-            previous_time = timestamps.get(session["key"], _MISSING)
-            published_at = datetime.now(timezone.utc).isoformat()
-            objects[session["key"]] = entry
-            timestamps[session["key"]] = published_at
-            version_id = None
-            if versioning_on:
-                version_id = self._append_version(tenant, session["key"], entry)
-            record = {"key": session["key"], "entry": dict(entry),
-                      "tenant": tenant}
-            if version_id is not None:
-                record["version_id"] = version_id
-            self._upload_records[session_id] = record
-            try:
-                self._save_index()
-            except OSError:
-                del self._upload_records[session_id]
-                if version_id is not None:
-                    self._versions[tenant][session["key"]].pop()
-                    self._drop_versions_key(tenant, session["key"])
-                if previous is _MISSING:
-                    del objects[session["key"]]
+        try:
+            self._check_session_id(session_id)
+            with self._lock:
+                record = self._upload_records.get(session_id)
+                if record is not None:
+                    if record["tenant"] != tenant:
+                        raise ObjectStoreError(
+                            "unknown upload session: %r" % (session_id,))
+                    result = dict(record["entry"])
+                    if record.get("version_id") is not None:
+                        result["version_id"] = record["version_id"]
+                    snapshot = None
+                    fields = {"key": record["key"], "session": session_id,
+                              "sha256": result["sha256"],
+                              "size": result["size"]}
                 else:
-                    objects[session["key"]] = previous
-                if previous_time is _MISSING:
-                    timestamps.pop(session["key"], None)
-                else:
-                    timestamps[session["key"]] = previous_time
-                raise ObjectStoreError("upload io error")
-            del self._uploads[session_id]
-            self._discard_session_files(session_id)
-            result = dict(entry)
-            if version_id is not None:
-                result["version_id"] = version_id
-            return result
+                    session = self._uploads.get(session_id)
+                    if session is None or session["tenant"] != tenant:
+                        raise ObjectStoreError("unknown upload session: %r" % (session_id,))
+                    if session["offset"] != session["size"]:
+                        raise SessionConflict(
+                            "upload incomplete: %d of %d bytes received"
+                            % (session["offset"], session["size"]))
+                    data = self._read_part(session_id, 0, session["size"])
+                    if len(data) != session["size"]:
+                        raise ObjectStoreError("upload io error")
+                    if hashlib.sha256(data).hexdigest() != session["sha256"]:
+                        raise SessionConflict("upload hash mismatch")
+                    expected = session.get("expected_sha256", _MISSING)
+                    if expected is not _MISSING and not self._precondition_met(
+                            tenant, session["key"], expected):
+                        raise ObjectStoreError("precondition failed")
+                    self._rate_limit_check(tenant)
+                    entry = {"sha256": session["sha256"], "size": session["size"],
+                             "content_type": session["content_type"]}
+                    # The session's own reservation is lifted before the quota check:
+                    # its reserved bytes become the used bytes being published.
+                    versioning_on = self._versioning.get(tenant, False)
+                    delta_bytes, delta_objects = self._publish_delta(
+                        tenant, session["key"], entry, versioning_on)
+                    self._enforce_quota(tenant, delta_bytes, delta_objects,
+                                        release_session=session)
+                    snapshot = self._audit_snapshot(tenant)
+                    self._store_blob(session["sha256"], data)
+                    objects = self._objects.setdefault(tenant, {})
+                    timestamps = self._timestamps.setdefault(tenant, {})
+                    previous = objects.get(session["key"], _MISSING)
+                    previous_time = timestamps.get(session["key"], _MISSING)
+                    published_at = datetime.now(timezone.utc).isoformat()
+                    objects[session["key"]] = entry
+                    timestamps[session["key"]] = published_at
+                    version_id = None
+                    if versioning_on:
+                        version_id = self._append_version(tenant, session["key"], entry)
+                    record = {"key": session["key"], "entry": dict(entry),
+                              "tenant": tenant}
+                    if version_id is not None:
+                        record["version_id"] = version_id
+                    self._upload_records[session_id] = record
+                    try:
+                        self._save_index()
+                    except OSError:
+                        del self._upload_records[session_id]
+                        if version_id is not None:
+                            self._versions[tenant][session["key"]].pop()
+                            self._drop_versions_key(tenant, session["key"])
+                        if previous is _MISSING:
+                            del objects[session["key"]]
+                        else:
+                            objects[session["key"]] = previous
+                        if previous_time is _MISSING:
+                            timestamps.pop(session["key"], None)
+                        else:
+                            timestamps[session["key"]] = previous_time
+                        raise ObjectStoreError("upload io error")
+                    result = dict(entry)
+                    if version_id is not None:
+                        result["version_id"] = version_id
+                    fields = {"key": session["key"], "session": session_id,
+                              "sha256": entry["sha256"], "size": entry["size"]}
+        except ObjectStoreError as exc:
+            self._audit_error(tenant, "complete_upload", exc,
+                              session=session_id)
+            raise
+        try:
+            self._audit_ok(tenant, "complete_upload", **fields)
+        except ObjectStoreError:
+            if snapshot is not None:
+                with self._lock:
+                    try:
+                        self._audit_restore(tenant, snapshot)
+                    except OSError:
+                        pass
+            raise
+        if snapshot is not None:
+            with self._lock:
+                del self._uploads[session_id]
+                self._discard_session_files(session_id)
+        return result
 
     def abort_upload(self, session_id, tenant=DEFAULT_TENANT):
         """Drop *session_id* and return None; published objects are kept."""
         self._check_tenant(tenant)
-        self._check_session_id(session_id)
-        with self._lock:
-            self._rate_limit_check(tenant)
-            record = self._upload_records.get(session_id)
-            if record is not None:
-                if record["tenant"] != tenant:
-                    raise ObjectStoreError(
-                        "unknown upload session: %r" % (session_id,))
-                del self._upload_records[session_id]
-                try:
-                    self._save_index()
-                except OSError:
+        try:
+            self._check_session_id(session_id)
+            with self._lock:
+                self._rate_limit_check(tenant)
+                record = self._upload_records.get(session_id)
+                session = None
+                received = None
+                if record is not None:
+                    if record["tenant"] != tenant:
+                        raise ObjectStoreError(
+                            "unknown upload session: %r" % (session_id,))
+                    del self._upload_records[session_id]
+                    try:
+                        self._save_index()
+                    except OSError:
+                        self._upload_records[session_id] = record
+                        raise ObjectStoreError("upload io error")
+                    self._discard_session_files(session_id)
+                else:
+                    session = self._uploads.get(session_id)
+                    if session is None or session["tenant"] != tenant:
+                        raise ObjectStoreError("unknown upload session: %r" % (session_id,))
+                    received = self._read_part(session_id, 0, session["offset"])
+                    self._remove_session_files(session_id)
+                    del self._uploads[session_id]
+        except ObjectStoreError as exc:
+            self._audit_error(tenant, "abort_upload", exc, session=session_id)
+            raise
+        try:
+            self._audit_ok(tenant, "abort_upload", session=session_id)
+        except ObjectStoreError:
+            with self._lock:
+                if record is not None:
                     self._upload_records[session_id] = record
-                    raise ObjectStoreError("upload io error")
-                self._discard_session_files(session_id)
-                return None
-            session = self._uploads.get(session_id)
-            if session is None or session["tenant"] != tenant:
-                raise ObjectStoreError("unknown upload session: %r" % (session_id,))
-            self._remove_session_files(session_id)
-            del self._uploads[session_id]
-            return None
+                    try:
+                        self._save_index()
+                    except OSError:
+                        pass
+                else:
+                    try:
+                        os.makedirs(self.uploads_dir, exist_ok=True)
+                        with open(self._session_part_path(session_id),
+                                  "wb") as handle:
+                            handle.write(received)
+                            handle.flush()
+                            os.fsync(handle.fileno())
+                        self._save_session(session_id, session)
+                        self._uploads[session_id] = session
+                    except (OSError, ObjectStoreError):
+                        pass
+            raise
+        return None
 
     def collect_garbage(self, dry_run=True):
         """Collect unreferenced blobs, previewing by default.
@@ -1246,60 +1684,69 @@ class ContentAddressedStore:
         incomplete upload session are live as well. The whole operation runs
         under the store lock, so blobs published
         concurrently stay referenced and candidates that vanished between
-        the scan and deletion are skipped rather than counted.
+        the scan and deletion are skipped rather than counted. The run is
+        audited under the ``global`` tenant.
         """
-        if not isinstance(dry_run, bool):
-            raise ObjectStoreError("invalid dry_run")
-        with self._lock:
-            referenced = {
-                entry["sha256"]
-                for objects in self._objects.values()
-                for entry in objects.values()
-            }
-            for keymap in self._versions.values():
-                for versions in keymap.values():
-                    for version in versions:
-                        referenced.add(version["sha256"])
-            for session in self._uploads.values():
-                referenced.add(session["sha256"])
-            try:
-                names = os.listdir(self.blobs_dir)
-            except OSError:
-                raise ObjectStoreError("gc io error")
-            candidates = []
-            for name in names:
-                if not _is_sha256(name) or name in referenced:
-                    continue
-                path = os.path.join(self.blobs_dir, name)
-                try:
-                    info = os.lstat(path)
-                except FileNotFoundError:
-                    continue
-                except OSError:
-                    raise ObjectStoreError("gc io error")
-                if not stat.S_ISREG(info.st_mode):
-                    continue
-                candidates.append((name, info.st_size))
-            candidates.sort(key=lambda item: item[0])
-            if dry_run:
-                return {
-                    "digests": [name for name, _ in candidates],
-                    "bytes": sum(size for _, size in candidates),
-                    "dry_run": True,
+        try:
+            if not isinstance(dry_run, bool):
+                raise ObjectStoreError("invalid dry_run")
+            with self._lock:
+                referenced = {
+                    entry["sha256"]
+                    for objects in self._objects.values()
+                    for entry in objects.values()
                 }
-            deleted = []
-            freed = 0
-            for name, size in candidates:
-                path = os.path.join(self.blobs_dir, name)
+                for keymap in self._versions.values():
+                    for versions in keymap.values():
+                        for version in versions:
+                            referenced.add(version["sha256"])
+                for session in self._uploads.values():
+                    referenced.add(session["sha256"])
                 try:
-                    os.remove(path)
-                except FileNotFoundError:
-                    continue
+                    names = os.listdir(self.blobs_dir)
                 except OSError:
                     raise ObjectStoreError("gc io error")
-                deleted.append(name)
-                freed += size
-            return {"digests": deleted, "bytes": freed, "dry_run": False}
+                candidates = []
+                for name in names:
+                    if not _is_sha256(name) or name in referenced:
+                        continue
+                    path = os.path.join(self.blobs_dir, name)
+                    try:
+                        info = os.lstat(path)
+                    except FileNotFoundError:
+                        continue
+                    except OSError:
+                        raise ObjectStoreError("gc io error")
+                    if not stat.S_ISREG(info.st_mode):
+                        continue
+                    candidates.append((name, info.st_size))
+                candidates.sort(key=lambda item: item[0])
+                if dry_run:
+                    result = {
+                        "digests": [name for name, _ in candidates],
+                        "bytes": sum(size for _, size in candidates),
+                        "dry_run": True,
+                    }
+                else:
+                    deleted = []
+                    freed = 0
+                    for name, size in candidates:
+                        path = os.path.join(self.blobs_dir, name)
+                        try:
+                            os.remove(path)
+                        except FileNotFoundError:
+                            continue
+                        except OSError:
+                            raise ObjectStoreError("gc io error")
+                        deleted.append(name)
+                        freed += size
+                    result = {"digests": deleted, "bytes": freed,
+                              "dry_run": False}
+        except ObjectStoreError as exc:
+            self._audit_error(AUDIT_GLOBAL_TENANT, "collect_garbage", exc)
+            raise
+        self._audit_ok(AUDIT_GLOBAL_TENANT, "collect_garbage")
+        return result
 
     def list_objects(self, prefix="", after=None, limit=DEFAULT_LIMIT,
                      tenant=DEFAULT_TENANT):
@@ -1310,28 +1757,35 @@ class ContentAddressedStore:
         empty page.
         """
         self._check_tenant(tenant)
-        if not isinstance(prefix, str):
-            raise ObjectStoreError("invalid prefix: %r" % (prefix,))
-        if after is not None and not isinstance(after, str):
-            raise ObjectStoreError("invalid after: %r" % (after,))
-        limit = self._check_limit(limit)
-        with self._lock:
-            self._rate_limit_check(tenant)
-            objects = self._objects.get(tenant, {})
-            keys = sorted(key for key in objects if key.startswith(prefix))
-            if after:
-                keys = [key for key in keys if key > after]
-            page = keys[:limit]
-            items = [
-                {
-                    "key": key,
-                    "sha256": objects[key]["sha256"],
-                    "size": objects[key]["size"],
-                    "content_type": objects[key]["content_type"],
-                }
-                for key in page
-            ]
-            return {"items": items, "next_after": page[-1] if len(keys) > len(page) else None}
+        try:
+            if not isinstance(prefix, str):
+                raise ObjectStoreError("invalid prefix: %r" % (prefix,))
+            if after is not None and not isinstance(after, str):
+                raise ObjectStoreError("invalid after: %r" % (after,))
+            limit = self._check_limit(limit)
+            with self._lock:
+                self._rate_limit_check(tenant)
+                objects = self._objects.get(tenant, {})
+                keys = sorted(key for key in objects if key.startswith(prefix))
+                if after:
+                    keys = [key for key in keys if key > after]
+                page = keys[:limit]
+                items = [
+                    {
+                        "key": key,
+                        "sha256": objects[key]["sha256"],
+                        "size": objects[key]["size"],
+                        "content_type": objects[key]["content_type"],
+                    }
+                    for key in page
+                ]
+                result = {"items": items,
+                          "next_after": page[-1] if len(keys) > len(page) else None}
+        except ObjectStoreError as exc:
+            self._audit_error(tenant, "list_objects", exc)
+            raise
+        self._audit_ok(tenant, "list_objects")
+        return result
 
     # -- versioning ------------------------------------------------------
     def set_versioning(self, enabled, tenant=DEFAULT_TENANT):
@@ -1343,22 +1797,34 @@ class ContentAddressedStore:
         touched, so disabling and re-enabling keeps the history intact.
         """
         self._check_tenant(tenant)
-        if not isinstance(enabled, bool):
-            raise ObjectStoreError("invalid versioning")
-        with self._lock:
-            self._rate_limit_check(tenant)
-            if enabled:
-                self._versioning[tenant] = True
-            else:
-                self._versioning.pop(tenant, None)
-            self._save_index()
+        try:
+            if not isinstance(enabled, bool):
+                raise ObjectStoreError("invalid versioning")
+            with self._lock:
+                self._rate_limit_check(tenant)
+                snapshot = self._audit_snapshot(tenant)
+                if enabled:
+                    self._versioning[tenant] = True
+                else:
+                    self._versioning.pop(tenant, None)
+                self._save_index()
+        except ObjectStoreError as exc:
+            self._audit_error(tenant, "set_versioning", exc)
+            raise
+        self._audit_commit(tenant, snapshot, "set_versioning")
 
     def get_versioning(self, tenant=DEFAULT_TENANT):
         """Return whether *tenant* currently has versioning enabled."""
         self._check_tenant(tenant)
-        with self._lock:
-            self._rate_limit_check(tenant)
-            return bool(self._versioning.get(tenant, False))
+        try:
+            with self._lock:
+                self._rate_limit_check(tenant)
+                enabled = bool(self._versioning.get(tenant, False))
+        except ObjectStoreError as exc:
+            self._audit_error(tenant, "get_versioning", exc)
+            raise
+        self._audit_ok(tenant, "get_versioning")
+        return enabled
 
     def _require_versioning(self, tenant):
         if not self._versioning.get(tenant, False):
@@ -1398,28 +1864,34 @@ class ContentAddressedStore:
         versioning to be enabled for the tenant.
         """
         self._check_tenant(tenant)
-        self._check_key(key)
-        if after is not None and not isinstance(after, str):
-            raise ObjectStoreError("invalid version")
-        limit = self._check_limit(limit)
-        with self._lock:
-            self._rate_limit_check(tenant)
-            self._require_versioning(tenant)
-            versions = self._versions_of(tenant, key)
-            current_id = versions[-1]["version_id"]
-            ordered = list(reversed(versions))
-            if after is not None:
-                position = next(
-                    (index for index, version in enumerate(ordered)
-                     if version["version_id"] == after), None)
-                if position is None:
-                    raise ObjectStoreError("invalid version")
-                ordered = ordered[position + 1:]
-            page = ordered[:limit]
-            items = [self._version_item(version, current_id) for version in page]
-            return {"items": items,
-                    "next_after": page[-1]["version_id"]
-                    if len(ordered) > len(page) else None}
+        try:
+            self._check_key(key)
+            if after is not None and not isinstance(after, str):
+                raise ObjectStoreError("invalid version")
+            limit = self._check_limit(limit)
+            with self._lock:
+                self._rate_limit_check(tenant)
+                self._require_versioning(tenant)
+                versions = self._versions_of(tenant, key)
+                current_id = versions[-1]["version_id"]
+                ordered = list(reversed(versions))
+                if after is not None:
+                    position = next(
+                        (index for index, version in enumerate(ordered)
+                         if version["version_id"] == after), None)
+                    if position is None:
+                        raise ObjectStoreError("invalid version")
+                    ordered = ordered[position + 1:]
+                page = ordered[:limit]
+                items = [self._version_item(version, current_id) for version in page]
+                result = {"items": items,
+                          "next_after": page[-1]["version_id"]
+                          if len(ordered) > len(page) else None}
+        except ObjectStoreError as exc:
+            self._audit_error(tenant, "list_versions", exc, key=key)
+            raise
+        self._audit_ok(tenant, "list_versions", key=key)
+        return result
 
     def head_version(self, key, version_id, tenant=DEFAULT_TENANT,
                      expires=None, signature=None):
@@ -1434,14 +1906,22 @@ class ContentAddressedStore:
         before any key or version lookup.
         """
         self._check_tenant(tenant)
-        self._check_key(key)
-        with self._lock:
-            self._check_read_access(tenant, key, version_id, expires,
-                                    signature, "HEAD")
-            self._rate_limit_check(tenant)
-            self._require_versioning(tenant)
-            self._check_version_id(version_id)
-            return self._head_version_unlocked(tenant, key, version_id)
+        try:
+            self._check_key(key)
+            with self._lock:
+                self._check_read_access(tenant, key, version_id, expires,
+                                        signature, "HEAD")
+                self._rate_limit_check(tenant)
+                self._require_versioning(tenant)
+                self._check_version_id(version_id)
+                entry = self._head_version_unlocked(tenant, key, version_id)
+        except ObjectStoreError as exc:
+            self._audit_error(tenant, "head_version", exc, key=key,
+                              version=version_id)
+            raise
+        self._audit_ok(tenant, "head_version", key=key, version=version_id,
+                       sha256=entry["sha256"], size=entry["size"])
+        return entry
 
     def _head_version_unlocked(self, tenant, key, version_id):
         """Return one version's metadata; must be called under the lock."""
@@ -1463,18 +1943,25 @@ class ContentAddressedStore:
         method.
         """
         self._check_tenant(tenant)
-        self._check_key(key)
-        with self._lock:
-            self._check_read_access(tenant, key, version_id, expires,
-                                    signature, "GET")
-            self._rate_limit_check(tenant)
-            self._require_versioning(tenant)
-            self._check_version_id(version_id)
-            entry = self._head_version_unlocked(tenant, key, version_id)
-            data = self._blob_unlocked(entry["sha256"])
-            if len(data) != entry["size"]:
-                raise ObjectStoreError("corrupted blob")
-            return data, entry
+        try:
+            self._check_key(key)
+            with self._lock:
+                self._check_read_access(tenant, key, version_id, expires,
+                                        signature, "GET")
+                self._rate_limit_check(tenant)
+                self._require_versioning(tenant)
+                self._check_version_id(version_id)
+                entry = self._head_version_unlocked(tenant, key, version_id)
+                data = self._blob_unlocked(entry["sha256"])
+                if len(data) != entry["size"]:
+                    raise ObjectStoreError("corrupted blob")
+        except ObjectStoreError as exc:
+            self._audit_error(tenant, "get_version", exc, key=key,
+                              version=version_id)
+            raise
+        self._audit_ok(tenant, "get_version", key=key, version=version_id,
+                       sha256=entry["sha256"], size=entry["size"])
+        return data, entry
 
     def delete_version(self, key, version_id, tenant=DEFAULT_TENANT):
         """Remove one version of *key* in *tenant* and return None.
@@ -1485,32 +1972,40 @@ class ContentAddressedStore:
         stay on disk for garbage collection.
         """
         self._check_tenant(tenant)
-        self._check_key(key)
-        with self._lock:
-            self._rate_limit_check(tenant)
-            self._require_versioning(tenant)
-            self._check_version_id(version_id)
-            versions = self._versions_of(tenant, key)
-            index = next((i for i, version in enumerate(versions)
-                          if version["version_id"] == version_id), None)
-            if index is None:
-                raise ObjectStoreError("not found: version %s" % (version_id,))
-            was_current = index == len(versions) - 1
-            del versions[index]
-            objects = self._objects.get(tenant, {})
-            if versions:
-                if was_current and key in objects:
-                    promoted = versions[-1]
-                    objects[key] = {"sha256": promoted["sha256"],
-                                    "size": promoted["size"],
-                                    "content_type": promoted["content_type"]}
-                    self._timestamps.setdefault(tenant, {})[key] = \
-                        promoted["created_at"]
-            else:
-                objects.pop(key, None)
-                self._timestamps.get(tenant, {}).pop(key, None)
-                self._drop_versions_key(tenant, key)
-            self._save_index()
+        try:
+            self._check_key(key)
+            with self._lock:
+                self._rate_limit_check(tenant)
+                self._require_versioning(tenant)
+                self._check_version_id(version_id)
+                versions = self._versions_of(tenant, key)
+                index = next((i for i, version in enumerate(versions)
+                              if version["version_id"] == version_id), None)
+                if index is None:
+                    raise ObjectStoreError("not found: version %s" % (version_id,))
+                snapshot = self._audit_snapshot(tenant)
+                was_current = index == len(versions) - 1
+                del versions[index]
+                objects = self._objects.get(tenant, {})
+                if versions:
+                    if was_current and key in objects:
+                        promoted = versions[-1]
+                        objects[key] = {"sha256": promoted["sha256"],
+                                        "size": promoted["size"],
+                                        "content_type": promoted["content_type"]}
+                        self._timestamps.setdefault(tenant, {})[key] = \
+                            promoted["created_at"]
+                else:
+                    objects.pop(key, None)
+                    self._timestamps.get(tenant, {}).pop(key, None)
+                    self._drop_versions_key(tenant, key)
+                self._save_index()
+        except ObjectStoreError as exc:
+            self._audit_error(tenant, "delete_version", exc, key=key,
+                              version=version_id)
+            raise
+        self._audit_commit(tenant, snapshot, "delete_version", key=key,
+                           version=version_id)
 
     # -- retention -------------------------------------------------------
     def set_retention(self, max_versions=None, max_age_seconds=None,
@@ -1524,22 +2019,28 @@ class ContentAddressedStore:
         effect through :meth:`purge_retention`.
         """
         self._check_tenant(tenant)
-        for value in (max_versions, max_age_seconds):
-            if value is not None and (isinstance(value, bool)
-                                      or not isinstance(value, int)
-                                      or value < 0):
+        try:
+            for value in (max_versions, max_age_seconds):
+                if value is not None and (isinstance(value, bool)
+                                          or not isinstance(value, int)
+                                          or value < 0):
+                    raise ObjectStoreError("invalid retention")
+            if max_versions is None and max_age_seconds is None:
                 raise ObjectStoreError("invalid retention")
-        if max_versions is None and max_age_seconds is None:
-            raise ObjectStoreError("invalid retention")
-        policy = {}
-        if max_versions is not None:
-            policy["max_versions"] = max_versions
-        if max_age_seconds is not None:
-            policy["max_age_seconds"] = max_age_seconds
-        with self._lock:
-            self._rate_limit_check(tenant)
-            self._retention[tenant] = policy
-            self._save_index()
+            policy = {}
+            if max_versions is not None:
+                policy["max_versions"] = max_versions
+            if max_age_seconds is not None:
+                policy["max_age_seconds"] = max_age_seconds
+            with self._lock:
+                self._rate_limit_check(tenant)
+                snapshot = self._audit_snapshot(tenant)
+                self._retention[tenant] = policy
+                self._save_index()
+        except ObjectStoreError as exc:
+            self._audit_error(tenant, "set_retention", exc)
+            raise
+        self._audit_commit(tenant, snapshot, "set_retention")
 
     def get_retention(self, tenant=DEFAULT_TENANT):
         """Return *tenant*'s retention policy, or None when none is saved.
@@ -1548,13 +2049,19 @@ class ContentAddressedStore:
         and ``max_age_seconds`` keys, unset limits reading as None.
         """
         self._check_tenant(tenant)
-        with self._lock:
-            self._rate_limit_check(tenant)
-            policy = self._retention.get(tenant)
-            if policy is None:
-                return None
-            return {"max_versions": policy.get("max_versions"),
-                    "max_age_seconds": policy.get("max_age_seconds")}
+        try:
+            with self._lock:
+                self._rate_limit_check(tenant)
+                policy = self._retention.get(tenant)
+                result = None
+                if policy is not None:
+                    result = {"max_versions": policy.get("max_versions"),
+                              "max_age_seconds": policy.get("max_age_seconds")}
+        except ObjectStoreError as exc:
+            self._audit_error(tenant, "get_retention", exc)
+            raise
+        self._audit_ok(tenant, "get_retention")
+        return result
 
     def purge_retention(self, dry_run=True, tenant=DEFAULT_TENANT):
         """Apply *tenant*'s saved retention policy to its object versions.
@@ -1569,73 +2076,84 @@ class ContentAddressedStore:
         policy the result is empty.
         """
         self._check_tenant(tenant)
-        if not isinstance(dry_run, bool):
-            raise ObjectStoreError("invalid dry_run")
-        with self._lock:
-            self._rate_limit_check(tenant)
-            policy = self._retention.get(tenant)
-            if policy is None:
-                return {"versions": [], "bytes": 0, "dry_run": dry_run}
-            max_versions = policy.get("max_versions")
-            max_age = policy.get("max_age_seconds")
-            now = datetime.now(timezone.utc)
-            keymap = self._versions.get(tenant, {})
-            plan = {}
-            purged = []
-            for key in sorted(keymap):
-                versions = keymap[key]
-                if not versions:
-                    continue
-                remove = set()
-                if max_versions is not None:
-                    keep = max(1, max_versions)
-                    for version in versions[:-keep]:
-                        remove.add(version["version_id"])
-                if max_age is not None:
-                    cutoff = now - timedelta(seconds=max_age)
-                    for version in versions[:-1]:
-                        try:
-                            created = datetime.fromisoformat(
-                                version["created_at"])
-                        except ValueError:
+        try:
+            if not isinstance(dry_run, bool):
+                raise ObjectStoreError("invalid dry_run")
+            with self._lock:
+                self._rate_limit_check(tenant)
+                policy = self._retention.get(tenant)
+                snapshot = None
+                if policy is None:
+                    result = {"versions": [], "bytes": 0, "dry_run": dry_run}
+                else:
+                    max_versions = policy.get("max_versions")
+                    max_age = policy.get("max_age_seconds")
+                    now = datetime.now(timezone.utc)
+                    keymap = self._versions.get(tenant, {})
+                    plan = {}
+                    purged = []
+                    for key in sorted(keymap):
+                        versions = keymap[key]
+                        if not versions:
                             continue
-                        if created < cutoff:
-                            remove.add(version["version_id"])
-                if not remove:
-                    continue
-                plan[key] = remove
-                for version in versions:
-                    if version["version_id"] in remove:
-                        purged.append({"key": key,
-                                       "version_id": version["version_id"],
-                                       "sha256": version["sha256"],
-                                       "size": version["size"],
-                                       "created_at": version["created_at"]})
-            purged.sort(key=lambda item: item["version_id"])
-            result = {"versions": purged,
-                      "bytes": sum(item["size"] for item in purged),
-                      "dry_run": dry_run}
-            if dry_run or not plan:
-                return result
-            saved = {key: list(versions) for key, versions in keymap.items()}
-            for key, remove in plan.items():
-                remaining = [version for version in keymap[key]
-                             if version["version_id"] not in remove]
-                if remaining:
-                    keymap[key] = remaining
-                else:
-                    self._drop_versions_key(tenant, key)
-            if tenant in self._versions and not self._versions[tenant]:
-                del self._versions[tenant]
-            try:
-                self._save_index()
-            except OSError:
-                if saved:
-                    self._versions[tenant] = saved
-                else:
-                    self._versions.pop(tenant, None)
-                raise ObjectStoreError("version io error")
-            return result
+                        remove = set()
+                        if max_versions is not None:
+                            keep = max(1, max_versions)
+                            for version in versions[:-keep]:
+                                remove.add(version["version_id"])
+                        if max_age is not None:
+                            cutoff = now - timedelta(seconds=max_age)
+                            for version in versions[:-1]:
+                                try:
+                                    created = datetime.fromisoformat(
+                                        version["created_at"])
+                                except ValueError:
+                                    continue
+                                if created < cutoff:
+                                    remove.add(version["version_id"])
+                        if not remove:
+                            continue
+                        plan[key] = remove
+                        for version in versions:
+                            if version["version_id"] in remove:
+                                purged.append({"key": key,
+                                               "version_id": version["version_id"],
+                                               "sha256": version["sha256"],
+                                               "size": version["size"],
+                                               "created_at": version["created_at"]})
+                    purged.sort(key=lambda item: item["version_id"])
+                    result = {"versions": purged,
+                              "bytes": sum(item["size"] for item in purged),
+                              "dry_run": dry_run}
+                    if not dry_run and plan:
+                        snapshot = self._audit_snapshot(tenant)
+                        saved = {key: list(versions)
+                                 for key, versions in keymap.items()}
+                        for key, remove in plan.items():
+                            remaining = [version for version in keymap[key]
+                                         if version["version_id"] not in remove]
+                            if remaining:
+                                keymap[key] = remaining
+                            else:
+                                self._drop_versions_key(tenant, key)
+                        if tenant in self._versions and not self._versions[tenant]:
+                            del self._versions[tenant]
+                        try:
+                            self._save_index()
+                        except OSError:
+                            if saved:
+                                self._versions[tenant] = saved
+                            else:
+                                self._versions.pop(tenant, None)
+                            raise ObjectStoreError("version io error")
+        except ObjectStoreError as exc:
+            self._audit_error(tenant, "purge_retention", exc)
+            raise
+        if snapshot is not None:
+            self._audit_commit(tenant, snapshot, "purge_retention")
+        else:
+            self._audit_ok(tenant, "purge_retention")
+        return result
 
     # -- quota and usage -------------------------------------------------
     @staticmethod
@@ -1746,30 +2264,36 @@ class ContentAddressedStore:
         versions).
         """
         self._check_tenant(tenant)
-        for value in (max_bytes, max_objects):
-            if value is not None and (isinstance(value, bool)
-                                      or not isinstance(value, int)
-                                      or value < 0):
+        try:
+            for value in (max_bytes, max_objects):
+                if value is not None and (isinstance(value, bool)
+                                          or not isinstance(value, int)
+                                          or value < 0):
+                    raise ObjectStoreError("invalid quota")
+            if max_bytes is None and max_objects is None:
                 raise ObjectStoreError("invalid quota")
-        if max_bytes is None and max_objects is None:
-            raise ObjectStoreError("invalid quota")
-        policy = {}
-        if max_bytes is not None:
-            policy["max_bytes"] = max_bytes
-        if max_objects is not None:
-            policy["max_objects"] = max_objects
-        with self._lock:
-            self._rate_limit_check(tenant)
-            previous = self._quota.get(tenant)
-            self._quota[tenant] = policy
-            try:
-                self._save_index()
-            except OSError:
-                if previous is None:
-                    del self._quota[tenant]
-                else:
-                    self._quota[tenant] = previous
-                raise ObjectStoreError("quota io error")
+            policy = {}
+            if max_bytes is not None:
+                policy["max_bytes"] = max_bytes
+            if max_objects is not None:
+                policy["max_objects"] = max_objects
+            with self._lock:
+                self._rate_limit_check(tenant)
+                snapshot = self._audit_snapshot(tenant)
+                previous = self._quota.get(tenant)
+                self._quota[tenant] = policy
+                try:
+                    self._save_index()
+                except OSError:
+                    if previous is None:
+                        del self._quota[tenant]
+                    else:
+                        self._quota[tenant] = previous
+                    raise ObjectStoreError("quota io error")
+        except ObjectStoreError as exc:
+            self._audit_error(tenant, "set_quota", exc)
+            raise
+        self._audit_commit(tenant, snapshot, "set_quota")
 
     def get_quota(self, tenant=DEFAULT_TENANT):
         """Return *tenant*'s quota policy, or None when none is saved.
@@ -1778,13 +2302,19 @@ class ContentAddressedStore:
         ``max_objects`` keys, unset limits reading as None.
         """
         self._check_tenant(tenant)
-        with self._lock:
-            self._rate_limit_check(tenant)
-            policy = self._quota.get(tenant)
-            if policy is None:
-                return None
-            return {"max_bytes": policy.get("max_bytes"),
-                    "max_objects": policy.get("max_objects")}
+        try:
+            with self._lock:
+                self._rate_limit_check(tenant)
+                policy = self._quota.get(tenant)
+                result = None
+                if policy is not None:
+                    result = {"max_bytes": policy.get("max_bytes"),
+                              "max_objects": policy.get("max_objects")}
+        except ObjectStoreError as exc:
+            self._audit_error(tenant, "get_quota", exc)
+            raise
+        self._audit_ok(tenant, "get_quota")
+        return result
 
     def clear_quota(self, tenant=DEFAULT_TENANT):
         """Drop *tenant*'s quota policy and return None; the tenant is unlimited.
@@ -1794,15 +2324,21 @@ class ContentAddressedStore:
         previous policy.
         """
         self._check_tenant(tenant)
-        with self._lock:
-            self._rate_limit_check(tenant)
-            previous = self._quota.pop(tenant, None)
-            try:
-                self._save_index()
-            except OSError:
-                if previous is not None:
-                    self._quota[tenant] = previous
-                raise ObjectStoreError("quota io error")
+        try:
+            with self._lock:
+                self._rate_limit_check(tenant)
+                snapshot = self._audit_snapshot(tenant)
+                previous = self._quota.pop(tenant, None)
+                try:
+                    self._save_index()
+                except OSError:
+                    if previous is not None:
+                        self._quota[tenant] = previous
+                    raise ObjectStoreError("quota io error")
+        except ObjectStoreError as exc:
+            self._audit_error(tenant, "clear_quota", exc)
+            raise
+        self._audit_commit(tenant, snapshot, "clear_quota")
 
     def get_usage(self, tenant=DEFAULT_TENANT):
         """Return *tenant*'s current usage as four integer counters.
@@ -1815,9 +2351,15 @@ class ContentAddressedStore:
         active upload sessions, released on completion or abort.
         """
         self._check_tenant(tenant)
-        with self._lock:
-            self._rate_limit_check(tenant)
-            return self._usage_unlocked(tenant)
+        try:
+            with self._lock:
+                self._rate_limit_check(tenant)
+                usage = self._usage_unlocked(tenant)
+        except ObjectStoreError as exc:
+            self._audit_error(tenant, "get_usage", exc)
+            raise
+        self._audit_ok(tenant, "get_usage")
+        return usage
 
     # -- lifecycle -------------------------------------------------------
     def set_lifecycle(self, max_age_seconds, prefix="", tenant=DEFAULT_TENANT):
@@ -1833,19 +2375,25 @@ class ContentAddressedStore:
         policy.
         """
         self._check_tenant(tenant)
-        policy = self._check_lifecycle_values(prefix, max_age_seconds)
-        with self._lock:
-            self._rate_limit_check(tenant)
-            previous = self._lifecycle.get(tenant)
-            self._lifecycle[tenant] = policy
-            try:
-                self._save_index()
-            except OSError:
-                if previous is None:
-                    del self._lifecycle[tenant]
-                else:
-                    self._lifecycle[tenant] = previous
-                raise ObjectStoreError("lifecycle io error")
+        try:
+            policy = self._check_lifecycle_values(prefix, max_age_seconds)
+            with self._lock:
+                self._rate_limit_check(tenant)
+                snapshot = self._audit_snapshot(tenant)
+                previous = self._lifecycle.get(tenant)
+                self._lifecycle[tenant] = policy
+                try:
+                    self._save_index()
+                except OSError:
+                    if previous is None:
+                        del self._lifecycle[tenant]
+                    else:
+                        self._lifecycle[tenant] = previous
+                    raise ObjectStoreError("lifecycle io error")
+        except ObjectStoreError as exc:
+            self._audit_error(tenant, "set_lifecycle", exc)
+            raise
+        self._audit_commit(tenant, snapshot, "set_lifecycle")
 
     @staticmethod
     def _check_lifecycle_values(prefix, max_age_seconds):
@@ -1860,13 +2408,19 @@ class ContentAddressedStore:
     def get_lifecycle(self, tenant=DEFAULT_TENANT):
         """Return *tenant*'s lifecycle policy, or None when none is saved."""
         self._check_tenant(tenant)
-        with self._lock:
-            self._rate_limit_check(tenant)
-            policy = self._lifecycle.get(tenant)
-            if policy is None:
-                return None
-            return {"prefix": policy["prefix"],
-                    "max_age_seconds": policy["max_age_seconds"]}
+        try:
+            with self._lock:
+                self._rate_limit_check(tenant)
+                policy = self._lifecycle.get(tenant)
+                result = None
+                if policy is not None:
+                    result = {"prefix": policy["prefix"],
+                              "max_age_seconds": policy["max_age_seconds"]}
+        except ObjectStoreError as exc:
+            self._audit_error(tenant, "get_lifecycle", exc)
+            raise
+        self._audit_ok(tenant, "get_lifecycle")
+        return result
 
     def clear_lifecycle(self, tenant=DEFAULT_TENANT):
         """Drop *tenant*'s lifecycle policy and return None.
@@ -1876,15 +2430,21 @@ class ContentAddressedStore:
         the previous policy.
         """
         self._check_tenant(tenant)
-        with self._lock:
-            self._rate_limit_check(tenant)
-            previous = self._lifecycle.pop(tenant, None)
-            try:
-                self._save_index()
-            except OSError:
-                if previous is not None:
-                    self._lifecycle[tenant] = previous
-                raise ObjectStoreError("lifecycle io error")
+        try:
+            with self._lock:
+                self._rate_limit_check(tenant)
+                snapshot = self._audit_snapshot(tenant)
+                previous = self._lifecycle.pop(tenant, None)
+                try:
+                    self._save_index()
+                except OSError:
+                    if previous is not None:
+                        self._lifecycle[tenant] = previous
+                    raise ObjectStoreError("lifecycle io error")
+        except ObjectStoreError as exc:
+            self._audit_error(tenant, "clear_lifecycle", exc)
+            raise
+        self._audit_commit(tenant, snapshot, "clear_lifecycle")
 
     @staticmethod
     def _parse_timestamp(value):
@@ -1917,55 +2477,65 @@ class ContentAddressedStore:
         ``ObjectStoreError("lifecycle io error")``.
         """
         self._check_tenant(tenant)
-        if not isinstance(dry_run, bool):
-            raise ObjectStoreError("invalid dry_run")
-        with self._lock:
-            self._rate_limit_check(tenant)
-            policy = self._lifecycle.get(tenant)
-            if policy is None:
-                return {"objects": [], "bytes": 0, "dry_run": dry_run}
-            prefix = policy["prefix"]
-            cutoff = datetime.now(timezone.utc) - timedelta(
-                seconds=policy["max_age_seconds"])
-            objects = self._objects.get(tenant, {})
-            timestamps = self._timestamps.get(tenant, {})
-            candidates = []
-            for key in sorted(objects):
-                if not key.startswith(prefix):
-                    continue
-                last_modified = timestamps.get(key)
-                if last_modified is None:
-                    continue
-                if self._parse_timestamp(last_modified) < cutoff:
-                    entry = objects[key]
-                    candidates.append({
-                        "key": key,
-                        "sha256": entry["sha256"],
-                        "size": entry["size"],
-                    })
-            result = {"objects": candidates,
-                      "bytes": sum(item["size"] for item in candidates),
-                      "dry_run": dry_run}
-            if dry_run or not candidates:
-                return result
-            saved_objects = {name: dict(mapping)
-                             for name, mapping in self._objects.items()}
-            saved_timestamps = {name: dict(mapping)
-                                for name, mapping in self._timestamps.items()}
-            saved_versions = {
-                name: {key: list(versions)
-                       for key, versions in keymap.items()}
-                for name, keymap in self._versions.items()}
-            try:
-                for item in candidates:
-                    self._remove_current_unlocked(tenant, item["key"])
-                self._save_index()
-            except OSError:
-                self._objects = saved_objects
-                self._timestamps = saved_timestamps
-                self._versions = saved_versions
-                raise ObjectStoreError("lifecycle io error")
-            return result
+        try:
+            if not isinstance(dry_run, bool):
+                raise ObjectStoreError("invalid dry_run")
+            with self._lock:
+                self._rate_limit_check(tenant)
+                policy = self._lifecycle.get(tenant)
+                snapshot = None
+                if policy is None:
+                    result = {"objects": [], "bytes": 0, "dry_run": dry_run}
+                else:
+                    prefix = policy["prefix"]
+                    cutoff = datetime.now(timezone.utc) - timedelta(
+                        seconds=policy["max_age_seconds"])
+                    objects = self._objects.get(tenant, {})
+                    timestamps = self._timestamps.get(tenant, {})
+                    candidates = []
+                    for key in sorted(objects):
+                        if not key.startswith(prefix):
+                            continue
+                        last_modified = timestamps.get(key)
+                        if last_modified is None:
+                            continue
+                        if self._parse_timestamp(last_modified) < cutoff:
+                            entry = objects[key]
+                            candidates.append({
+                                "key": key,
+                                "sha256": entry["sha256"],
+                                "size": entry["size"],
+                            })
+                    result = {"objects": candidates,
+                              "bytes": sum(item["size"] for item in candidates),
+                              "dry_run": dry_run}
+                    if not dry_run and candidates:
+                        snapshot = self._audit_snapshot(tenant)
+                        saved_objects = {name: dict(mapping)
+                                         for name, mapping in self._objects.items()}
+                        saved_timestamps = {name: dict(mapping)
+                                            for name, mapping in self._timestamps.items()}
+                        saved_versions = {
+                            name: {key: list(versions)
+                                   for key, versions in keymap.items()}
+                            for name, keymap in self._versions.items()}
+                        try:
+                            for item in candidates:
+                                self._remove_current_unlocked(tenant, item["key"])
+                            self._save_index()
+                        except OSError:
+                            self._objects = saved_objects
+                            self._timestamps = saved_timestamps
+                            self._versions = saved_versions
+                            raise ObjectStoreError("lifecycle io error")
+        except ObjectStoreError as exc:
+            self._audit_error(tenant, "run_lifecycle", exc)
+            raise
+        if snapshot is not None:
+            self._audit_commit(tenant, snapshot, "run_lifecycle")
+        else:
+            self._audit_ok(tenant, "run_lifecycle")
+        return result
 
     # -- access policy and read signatures -------------------------------
     @staticmethod
@@ -1985,12 +2555,18 @@ class ContentAddressedStore:
         in) or ``{"mode": "signed", "secret": <str>}`` for a signed tenant.
         """
         self._check_tenant(tenant)
-        with self._lock:
-            self._rate_limit_check(tenant)
-            policy = self._access.get(tenant)
-            if policy is None:
-                return {"mode": "public"}
-            return {"mode": "signed", "secret": policy["secret"]}
+        try:
+            with self._lock:
+                self._rate_limit_check(tenant)
+                policy = self._access.get(tenant)
+                result = {"mode": "public"}
+                if policy is not None:
+                    result = {"mode": "signed", "secret": policy["secret"]}
+        except ObjectStoreError as exc:
+            self._audit_error(tenant, "get_access_policy", exc)
+            raise
+        self._audit_ok(tenant, "get_access_policy")
+        return result
 
     def set_access_policy(self, mode, secret=None, tenant=DEFAULT_TENANT):
         """Save *tenant*'s read access policy.
@@ -2004,24 +2580,35 @@ class ContentAddressedStore:
         and keeps the previous policy.
         """
         self._check_tenant(tenant)
-        if mode == "public":
-            self.clear_access_policy(tenant=tenant)
-            return
-        if mode != "signed":
-            raise ObjectStoreError("invalid access policy")
-        secret = self._check_secret(secret, "invalid access policy")
-        with self._lock:
-            self._rate_limit_check(tenant)
-            previous = self._access.get(tenant, _MISSING)
-            self._access[tenant] = {"mode": "signed", "secret": secret}
-            try:
-                self._save_index()
-            except OSError:
-                if previous is _MISSING:
-                    del self._access[tenant]
+        try:
+            if mode == "public":
+                policy = None
+            elif mode == "signed":
+                policy = {"mode": "signed",
+                          "secret": self._check_secret(
+                              secret, "invalid access policy")}
+            else:
+                raise ObjectStoreError("invalid access policy")
+            with self._lock:
+                self._rate_limit_check(tenant)
+                snapshot = self._audit_snapshot(tenant)
+                previous = self._access.get(tenant, _MISSING)
+                if policy is None:
+                    self._access.pop(tenant, None)
                 else:
-                    self._access[tenant] = previous
-                raise ObjectStoreError("access policy io error")
+                    self._access[tenant] = policy
+                try:
+                    self._save_index()
+                except OSError:
+                    if previous is _MISSING:
+                        self._access.pop(tenant, None)
+                    else:
+                        self._access[tenant] = previous
+                    raise ObjectStoreError("access policy io error")
+        except ObjectStoreError as exc:
+            self._audit_error(tenant, "set_access_policy", exc)
+            raise
+        self._audit_commit(tenant, snapshot, "set_access_policy")
 
     def clear_access_policy(self, tenant=DEFAULT_TENANT):
         """Drop *tenant*'s access policy, restoring public reads.
@@ -2031,15 +2618,21 @@ class ContentAddressedStore:
         and keeps the previous policy.
         """
         self._check_tenant(tenant)
-        with self._lock:
-            self._rate_limit_check(tenant)
-            previous = self._access.pop(tenant, None)
-            try:
-                self._save_index()
-            except OSError:
-                if previous is not None:
-                    self._access[tenant] = previous
-                raise ObjectStoreError("access policy io error")
+        try:
+            with self._lock:
+                self._rate_limit_check(tenant)
+                snapshot = self._audit_snapshot(tenant)
+                previous = self._access.pop(tenant, None)
+                try:
+                    self._save_index()
+                except OSError:
+                    if previous is not None:
+                        self._access[tenant] = previous
+                    raise ObjectStoreError("access policy io error")
+        except ObjectStoreError as exc:
+            self._audit_error(tenant, "clear_access_policy", exc)
+            raise
+        self._audit_commit(tenant, snapshot, "clear_access_policy")
 
     def sign_request(self, method, key, version_id=None, expires=None,
                      tenant=DEFAULT_TENANT):
@@ -2149,33 +2742,39 @@ class ContentAddressedStore:
         are kept; a window switch always resets them.
         """
         self._check_tenant(tenant)
-        if isinstance(window_seconds, bool) \
-                or not isinstance(window_seconds, int) \
-                or not 1 <= window_seconds <= 86400:
-            raise ObjectStoreError("invalid rate limit")
-        for value in (max_requests, max_bytes):
-            if value is not None and (isinstance(value, bool)
-                                      or not isinstance(value, int)
-                                      or value < 0):
+        try:
+            if isinstance(window_seconds, bool) \
+                    or not isinstance(window_seconds, int) \
+                    or not 1 <= window_seconds <= 86400:
                 raise ObjectStoreError("invalid rate limit")
-        if max_requests is None and max_bytes is None:
-            raise ObjectStoreError("invalid rate limit")
-        policy = {"window_seconds": window_seconds}
-        if max_requests is not None:
-            policy["max_requests"] = max_requests
-        if max_bytes is not None:
-            policy["max_bytes"] = max_bytes
-        with self._lock:
-            previous = self._rate_limit.get(tenant)
-            self._rate_limit[tenant] = policy
-            try:
-                self._save_index()
-            except OSError:
-                if previous is None:
-                    del self._rate_limit[tenant]
-                else:
-                    self._rate_limit[tenant] = previous
-                raise ObjectStoreError("rate limit io error")
+            for value in (max_requests, max_bytes):
+                if value is not None and (isinstance(value, bool)
+                                          or not isinstance(value, int)
+                                          or value < 0):
+                    raise ObjectStoreError("invalid rate limit")
+            if max_requests is None and max_bytes is None:
+                raise ObjectStoreError("invalid rate limit")
+            policy = {"window_seconds": window_seconds}
+            if max_requests is not None:
+                policy["max_requests"] = max_requests
+            if max_bytes is not None:
+                policy["max_bytes"] = max_bytes
+            with self._lock:
+                snapshot = self._audit_snapshot(tenant)
+                previous = self._rate_limit.get(tenant)
+                self._rate_limit[tenant] = policy
+                try:
+                    self._save_index()
+                except OSError:
+                    if previous is None:
+                        del self._rate_limit[tenant]
+                    else:
+                        self._rate_limit[tenant] = previous
+                    raise ObjectStoreError("rate limit io error")
+        except ObjectStoreError as exc:
+            self._audit_error(tenant, "set_rate_limit", exc)
+            raise
+        self._audit_commit(tenant, snapshot, "set_rate_limit")
 
     def get_rate_limit(self, tenant=DEFAULT_TENANT):
         """Return *tenant*'s rate limit policy, or None when none is saved.
@@ -2185,13 +2784,19 @@ class ContentAddressedStore:
         None.
         """
         self._check_tenant(tenant)
-        with self._lock:
-            policy = self._rate_limit.get(tenant)
-            if policy is None:
-                return None
-            return {"window_seconds": policy["window_seconds"],
-                    "max_requests": policy.get("max_requests"),
-                    "max_bytes": policy.get("max_bytes")}
+        try:
+            with self._lock:
+                policy = self._rate_limit.get(tenant)
+                result = None
+                if policy is not None:
+                    result = {"window_seconds": policy["window_seconds"],
+                              "max_requests": policy.get("max_requests"),
+                              "max_bytes": policy.get("max_bytes")}
+        except ObjectStoreError as exc:
+            self._audit_error(tenant, "get_rate_limit", exc)
+            raise
+        self._audit_ok(tenant, "get_rate_limit")
+        return result
 
     def clear_rate_limit(self, tenant=DEFAULT_TENANT):
         """Drop *tenant*'s rate limit policy and return None.
@@ -2201,14 +2806,20 @@ class ContentAddressedStore:
         and keeps the previous policy.
         """
         self._check_tenant(tenant)
-        with self._lock:
-            previous = self._rate_limit.pop(tenant, None)
-            try:
-                self._save_index()
-            except OSError:
-                if previous is not None:
-                    self._rate_limit[tenant] = previous
-                raise ObjectStoreError("rate limit io error")
+        try:
+            with self._lock:
+                snapshot = self._audit_snapshot(tenant)
+                previous = self._rate_limit.pop(tenant, None)
+                try:
+                    self._save_index()
+                except OSError:
+                    if previous is not None:
+                        self._rate_limit[tenant] = previous
+                    raise ObjectStoreError("rate limit io error")
+        except ObjectStoreError as exc:
+            self._audit_error(tenant, "clear_rate_limit", exc)
+            raise
+        self._audit_commit(tenant, snapshot, "clear_rate_limit")
 
     def get_rate_limit_usage(self, tenant=DEFAULT_TENANT):
         """Return *tenant*'s current-window counters, or None without a policy.
@@ -2219,19 +2830,25 @@ class ContentAddressedStore:
         only: after a restart they start at zero for the current window.
         """
         self._check_tenant(tenant)
-        with self._lock:
-            policy = self._rate_limit.get(tenant)
-            if policy is None:
-                return None
-            now = int(time.time())
-            window = policy["window_seconds"]
-            window_start = (now // window) * window
-            state = self._rate_windows.get(tenant)
-            requests = bytes_used = 0
-            if state is not None and state["window_start"] == window_start:
-                requests = state["requests"]
-                bytes_used = state["bytes"]
-            return {"window_start": window_start,
-                    "reset_at": window_start + window,
-                    "requests": requests,
-                    "bytes": bytes_used}
+        try:
+            with self._lock:
+                policy = self._rate_limit.get(tenant)
+                usage = None
+                if policy is not None:
+                    now = int(time.time())
+                    window = policy["window_seconds"]
+                    window_start = (now // window) * window
+                    state = self._rate_windows.get(tenant)
+                    requests = bytes_used = 0
+                    if state is not None and state["window_start"] == window_start:
+                        requests = state["requests"]
+                        bytes_used = state["bytes"]
+                    usage = {"window_start": window_start,
+                             "reset_at": window_start + window,
+                             "requests": requests,
+                             "bytes": bytes_used}
+        except ObjectStoreError as exc:
+            self._audit_error(tenant, "get_rate_limit_usage", exc)
+            raise
+        self._audit_ok(tenant, "get_rate_limit_usage")
+        return usage
