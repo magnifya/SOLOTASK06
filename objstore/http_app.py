@@ -29,6 +29,13 @@ a rejected request gets ``429 {"error":"rate limit exceeded"}`` with a
 changes neither storage nor counters. The blob endpoint stays global: an
 absent or invalid tenant header never fails it, the request is simply
 accounted against the default tenant.
+
+The audit endpoints (``/v1/audit`` and ``/v1/audit/verify``) are
+tenant-scoped the same way and expose the tenant's persistent audit
+log; they record no audit events of their own and are never counted
+against the rate limit. A malformed query is ``400 {"error":"invalid
+audit query"}``, a broken log ``500 {"error":"audit corrupted"}`` and a
+log I/O failure ``500 {"error":"audit io error"}``.
 """
 
 from __future__ import annotations
@@ -66,6 +73,8 @@ _LIFECYCLE_RUN_PATH = "/v1/lifecycle/run"
 _ACCESS_POLICY_PATH = "/v1/access-policy"
 _RATE_LIMIT_PATH = "/v1/rate-limit"
 _RATE_LIMIT_USAGE_PATH = "/v1/rate-limit/usage"
+_AUDIT_PATH = "/v1/audit"
+_AUDIT_VERIFY_PATH = "/v1/audit/verify"
 _TENANT_HEADER = "X-Objstore-Tenant"
 _DEFAULT_CONTENT_TYPE = "application/octet-stream"
 _DECIMAL_RE = re.compile(r"\A[0-9]+\Z")
@@ -75,12 +84,14 @@ _BAD_REQUEST_PREFIXES = (
     "invalid precondition", "invalid tenant", "invalid version",
     "invalid retention", "invalid dry_run", "invalid quota",
     "invalid lifecycle", "invalid access policy", "invalid rate limit",
+    "invalid audit query",
     "versioning disabled",
     "payload", "content_type",
 )
 _INTERNAL_ERRORS = ("corrupted blob", "blob io error", "upload io error",
                     "version io error", "quota io error", "lifecycle io error",
-                    "access policy io error", "rate limit io error")
+                    "access policy io error", "rate limit io error",
+                    "audit corrupted", "audit io error")
 
 
 def _json_bytes(payload):
@@ -255,6 +266,17 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
                     return self._error(405, "method not allowed")
                 return self._send(200, _json_bytes(
                     self.server.store.get_rate_limit_usage(tenant=tenant)))
+            if path == _AUDIT_PATH:
+                tenant = self._tenant()
+                if method != "GET":
+                    return self._error(405, "method not allowed")
+                return self._audit_events(parsed.query, tenant)
+            if path == _AUDIT_VERIFY_PATH:
+                tenant = self._tenant()
+                if method != "GET":
+                    return self._error(405, "method not allowed")
+                return self._send(200, _json_bytes(
+                    self.server.store.verify_audit_log(tenant=tenant)))
             if path.startswith(_OBJECTS_PATH + "/"):
                 return self._object(method, unquote(path[len(_OBJECTS_PATH) + 1:]),
                                     parsed.query)
@@ -763,6 +785,31 @@ class ObjectStoreHandler(BaseHTTPRequestHandler):
             "max_requests": document.get("max_requests"),
             "max_bytes": document.get("max_bytes"),
         }))
+
+    # -- audit log --------------------------------------------------------
+    def _audit_events(self, query, tenant):
+        """Serve one page of the tenant's audit events.
+
+        ``after`` is an optional non-negative decimal ``seq`` cursor
+        (exclusive) and ``limit`` an optional 1-1000 page size; anything
+        else is the uniform ``invalid audit query`` 400.
+        """
+        params = parse_qs(query, keep_blank_values=True)
+        raw_after = params.get("after", [None])[0]
+        if raw_after is None:
+            after = None
+        elif _DECIMAL_RE.match(raw_after) is not None:
+            after = int(raw_after)
+        else:
+            raise ObjectStoreError("invalid audit query")
+        raw_limit = params.get("limit", [str(DEFAULT_LIMIT)])[0]
+        try:
+            limit = int(raw_limit)
+        except (TypeError, ValueError):
+            raise ObjectStoreError("invalid audit query")
+        result = self.server.store.list_audit_events(
+            after=after, limit=limit, tenant=tenant)
+        return self._send(200, _json_bytes(result))
 
 
 class ObjectStoreHTTPServer(ThreadingHTTPServer):

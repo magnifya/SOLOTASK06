@@ -350,7 +350,7 @@ class TestUploadPersistence(UploadTestCase):
         self.store.append_upload(session_id, 0, b"ab")
         self.store.complete_upload(session_id)
         self.assertFalse(os.path.exists(self.store.uploads_dir))
-        self.assertEqual(sorted(os.listdir(self.root)), ["blobs", "index.json"])
+        self.assertEqual(sorted(os.listdir(self.root)), ["audit.log", "blobs", "index.json"])
 
     def test_corrupted_session_files_are_reported(self):
         session_id = self.begin()

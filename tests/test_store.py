@@ -295,7 +295,7 @@ class TestPersistence(StoreTestCase):
     def test_no_temporary_files_left_behind(self):
         for index in range(5):
             self.store.put("k%d" % index, b"payload-%d" % index)
-        self.assertEqual(sorted(os.listdir(self.root)), ["blobs", "index.json"])
+        self.assertEqual(sorted(os.listdir(self.root)), ["audit.log", "blobs", "index.json"])
         self.assertEqual(len(self.store.blob_digests()), 5)
         self.assertTrue(all(len(name) == 64 for name in os.listdir(self.store.blobs_dir)))
 
